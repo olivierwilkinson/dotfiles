@@ -24,6 +24,8 @@ $RESET"
   install_with_brew pure fzf bat ripgrep grep watchman tmux withgraphite/tap/graphite aria2 tmuxinator
   install_with_brew --cask temurin
   install_tpm
+  install_nvim_plugins
+  setup_bat_cache
   setup_mac_system_configs
 }
 
@@ -50,6 +52,7 @@ link_config() {
 }
 
 setup_mac_system_configs() {
+  echo "${BLUE}Setting up mac system configs...$RESET"
   # Avoid creating .DS_Store files on network volumes
   defaults write com.apple.desktopservices DSDontWriteNetworkStores -bool true
 
@@ -63,9 +66,15 @@ setup_mac_system_configs() {
   echo "✅$GREEN Done setting up mac system configs $RESET"
 }
 
+setup_bat_cache() {
+  echo "${BLUE}Setting up bat cache...$RESET"
+  bat cache --build &>"$LOG_PATH"
+  echo "✅$GREEN Done setting up bat cache$RESET"
+}
+
 install_nvim_plugins() {
   echo "${BLUE}Installing nvim plugins...$RESET"
-  nvim --headless "+Lazy! sync" +qa
+  nvim --headless "+Lazy! sync" +qa &>"$LOG_PATH"
   echo "✅$GREEN Done installing nvim plugins$RESET"
 }
 

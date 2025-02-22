@@ -1,5 +1,14 @@
 #!/usr/bin/env zsh
 
+# Check if any SSH public key exists
+use_ssh_github() {
+  if [[ -f ~/.ssh/id_ed25519.pub || -f ~/.ssh/id_rsa.pub || -f ~/.ssh/id_ecdsa.pub ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
 # Create common color functions.
 autoload -U colors
 colors
@@ -24,11 +33,9 @@ case $ZSH_HOST_OS in
 esac
 
 # Install the antigen plugin/theme manager if it's not already installed.
-if [[ ! -d $HOME/antigen ]]; then
+if [[ ! -d /opt/homebrew/Cellar/antigen ]]; then
 	echo -e "Antigen not found, installing..."
-	cd $HOME
-	git clone https://github.com/shopify/antigen.git
-	cd -
+  brew install antigen
 fi
 
 # Symlink core configs

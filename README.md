@@ -9,7 +9,8 @@ Default theme is [Staples](https://github.com/dersam/staples).
 git clone git@github.com:olivierwilkinson/dotfiles.git ~/dotfiles
 ```
 2. Run `install.sh`. This will symlink configs and .zshrc, overwriting anything you already have.
-3. Open a new terminal, or `exec zsh`. Antigen bundles will be installed and you should be ready to go.
+3. Open a new terminal, or `exec zsh`. Antigen bundles will be installed
+4. Use CTRL+Space I (capital i) to install tmux plugins
 
 #### Available customizations
 Files are listed in the order they are loaded. Conflicts between files, such as

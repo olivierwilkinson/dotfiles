@@ -26,3 +26,5 @@ antigen apply
 source $DF_CORE/filter_history.zsh
 
 source $DF_USER/custom.zsh
+
+source $DF_HOME/extra.zsh
