@@ -1,0 +1,39 @@
+[include]
+
+	# Include user-specific info like git credentials.
+	path = ~/.gitconfig.local # not part of the dotfiles repo. Apply settings for a specific local environment that you don't want everywhere.
+	path = ~/dotfiles/personal/.gitconfig # Your personal gitconfig settings. Anything specific to you that you want everywhere.
+
+[apply]
+
+	# Detect whitespace errors when applying a patch
+	whitespace = fix
+
+[core]
+	# http://adaptivepatchwork.com/2012/03/01/mind-the-end-of-your-line/
+	ignorecase = false
+
+[diff]
+
+	# Detect copies as well as renames
+	renames = copies
+	algorithm = patience
+
+[help]
+
+	# Automatically correct and execute mistyped commands. Keep this off unless you enjoy pain.
+	autocorrect = 0
+
+[pull]
+	# Prevent automatic creation of merge commits if the pull can't fast forward.
+	# If a pull fails because of this, you can retry it with `git pull --rebase` to rebase onto the new commits.
+	# Shopify prefers to rebase, so this will require you to decide if a rebase is necessary.
+	ff = only
+
+[rerere]
+	# https://git-scm.com/docs/git-rerere
+	# Reuse Recorded Resolution
+	# If you have a merge conflict, this setting will record how that conflict was resolved. If you would then need to
+	# resolve that same conflict in a future rebase, this setting will reuse your previously recorded conflict resolution.
+	enabled = true
+	autoupdate = true

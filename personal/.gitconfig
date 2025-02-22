@@ -1,0 +1,7 @@
+# Add your preferred git settings here. This will overwrite anything in `core/configs/.gitconfig`.
+[user]
+    name = Olivier Wilkinson
+    email = olivier.wilkinson@gmail.com
+
+[core]
+    editor = nvim
