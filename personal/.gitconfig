@@ -5,3 +5,36 @@
 
 [core]
     editor = nvim
+    fsmonitor = true
+    untrackedCache = true
+
+[include]
+    path = /Users/olivier/.config/dev/gitconfig
+
+[column]
+    ui = auto
+
+[branch]
+    sort = -committerdate
+
+[tag]
+    sort = version:refname
+
+[init]
+    defaultBranch = main
+
+[diff]
+    algorithm = histogram
+    colorMoved = plain
+    mnemonicPrefix = true
+    renames = true
+
+[push]
+    autoSetupRemote = true
+
+[fetch]
+    prune = true
+    pruneTags = true
+
+[merge]
+    conflictStyle = zdiff3
