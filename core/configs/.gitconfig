@@ -37,3 +37,5 @@
 	# resolve that same conflict in a future rebase, this setting will reuse your previously recorded conflict resolution.
 	enabled = true
 	autoupdate = true
+[maintenance]
+	repo = /Users/olivier/world/trees/root/src

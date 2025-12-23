@@ -16,3 +16,5 @@ prompt pure
 if ! [[ -f $NVM_DIR/default-packages ]]; then
     ln -sfn $HOME/dotfiles/personal/nvm/default-packages $NVM_DIR/default-packages
 fi
+
+alias brain="cd ~/brain && devx claude"

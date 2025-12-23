@@ -15,9 +15,6 @@ export PATH=$PATH:$LATEXMK
 export PATH=$PATH:$LATEXINDENT
 export PATH=$PATH:/usr/local/texlive/2023/bin/universal-darwin
 
-# Perl setup
-eval "$(perl -I$HOME/perl5/lib/perl5 -Mlocal::lib)"
-
 # grit
 export GRIT_INSTALL="$HOME/.grit"
 export PATH="$GRIT_INSTALL/bin:$PATH"
