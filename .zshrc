@@ -9,6 +9,7 @@ colors
 # Set up custom environment variables
 source $DF_CORE/environment.zsh
 source $DF_USER/environment.zsh
+source $DF_USER/environment.local.zsh
 
 # Load configs for MacOS. Does nothing if not on MacOS
 if [ "$ZSH_HOST_OS" = "darwin" ]; then
