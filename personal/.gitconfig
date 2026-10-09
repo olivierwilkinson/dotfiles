@@ -11,10 +11,6 @@
 [include]
     path = /Users/olivier/.config/dev/gitconfig
 
-# Work identity + Shopify helpers — only for repos under ~/world/ (work machine)
-[includeIf "gitdir/i:~/world/"]
-    path = ~/dotfiles/personal/.gitconfig-work
-
 [column]
     ui = auto
 
@@ -42,3 +38,9 @@
 
 [merge]
     conflictStyle = zdiff3
+
+# Work identity + Shopify helpers, globally on the work machine. The gate file
+# below exists only there; on other machines the include is a no-op and the
+# personal identity above applies.
+[include]
+    path = /Users/olivier/.config/git/work.gitconfig

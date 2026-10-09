@@ -29,6 +29,13 @@ $RESET"
     link_config ~/dotfiles/personal/pi/subagents-config ~/.pi/agent/config/subagents
   fi
 
+  # Work git identity gate — exists only on the Shopify work machine (dev toolchain)
+  if [[ -d /opt/dev ]]; then
+    mkdir -p $HOME/.config/git
+    [[ -f $HOME/.config/git/work.gitconfig ]] || \
+      printf '[include]\n    path = ~/dotfiles/personal/.gitconfig-work\n' > $HOME/.config/git/work.gitconfig
+  fi
+
   # NOTE:- don't link nvm default-packages here, it will be linked in personal/custom.zsh
   # this is because nvm is installed after antigen is applied
 
