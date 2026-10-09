@@ -1,5 +1,8 @@
 # based on jenny-codes branch of dotfiles
 
+# Ensure brew is in PATH
+eval "$(/opt/homebrew/bin/brew shellenv)"
+
 LOG_PATH="/tmp/setup-$(date +%s).log"
 echo "Find logs at $LOG_PATH"
 
@@ -18,6 +21,13 @@ $RESET"
   link_config ~/dotfiles/personal/bat ~/.config/bat
   link_config ~/dotfiles/personal/tmuxinator ~/.config/tmuxinator
   link_config ~/dotfiles/personal/zellij ~/.config/zellij
+
+  # Pi agent definitions + subagents config — Shopify work machine with pi installed only
+  if [[ -d $HOME/.pi && -d /opt/dev ]]; then
+    link_config ~/dotfiles/personal/pi/agents ~/.pi/agent/agents
+    link_config ~/dotfiles/personal/pi/modes ~/.pi/agent/modes
+    link_config ~/dotfiles/personal/pi/subagents-config ~/.pi/agent/config/subagents
+  fi
 
   # NOTE:- don't link nvm default-packages here, it will be linked in personal/custom.zsh
   # this is because nvm is installed after antigen is applied
