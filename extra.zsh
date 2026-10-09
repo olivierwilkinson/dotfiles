@@ -19,8 +19,5 @@ export PATH=$PATH:/usr/local/texlive/2023/bin/universal-darwin
 export GRIT_INSTALL="$HOME/.grit"
 export PATH="$GRIT_INSTALL/bin:$PATH"
 
-# Android SDK
-export ANDROID_HOME=~/Library/Android/sdk
-
 # use cursor over code
 alias code="cursor"
