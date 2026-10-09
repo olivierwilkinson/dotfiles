@@ -11,15 +11,21 @@ return {
         ignored = true,
         grep = {
           hidden = true,
+          follow = true,
           ignored = false,
         },
         files = {
           hidden = true,
-          ignored = true,
+          follow = true,
         },
         explorer = {
           follow_file = true,
         },
+        icons = {
+          files = {
+            enabled = true
+          }
+        }
       },
       explorer = {
         replace_netrw = true,

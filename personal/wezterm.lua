@@ -8,7 +8,7 @@ config.hide_tab_bar_if_only_one_tab = true
 -- setup theme syncing with OS
 function scheme_for_appearance(appearance)
   if appearance:find "Dark" then
-    return "Catppuccin Mocha"
+    return "Catppuccin Frappe"
   else
     return "Catppuccin Frappe"
   end

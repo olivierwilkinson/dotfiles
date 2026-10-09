@@ -1,8 +1,15 @@
 -- Global options
 -- many options have been taken from Kickstart.nvim
 
--- use absolute line numbers
-vim.opt.number = true
+-- disable status line
+vim.opt.laststatus = 0
+
+-- use empty winbar on blurred windows
+vim.opt.winbar = " "
+
+-- use relative line numbers
+vim.wo.number = true
+vim.wo.relativenumber = true
 
 -- use system clipboard as default register
 vim.opt.clipboard:append("unnamedplus")
@@ -70,15 +77,11 @@ vim.api.nvim_create_autocmd('TextYankPost', {
     end,
 })
 
-vim.keymap.set('n', '<leader>ccf', function ()
-  vim.api.nvim_open_win(bufnr('%'), true, {
-    relative='win',
-    width=120,
-    height=10,
-    border="single",
-    win = 1001,
-    row = 20,
-    col = 20,
-    zindex=1000,
-  })
-end)
+-- autoread files when changed on the filesystem
+vim.opt.autoread = true
+
+-- automatically update files when changed in the background
+vim.api.nvim_create_autocmd({'FocusGained', 'BufEnter', 'CursorHold', 'CursorHoldI'}, {
+  pattern = '*',
+  command = "if mode() !~ '\v(c|r.?|!|t)' && getcmdwintype() == '' | checktime | endif",
+})

@@ -7,10 +7,15 @@ return {
   priority = 1000,
   config = true,
   opts = {
+    auto_start = false,
     terminal_cmd = "devx claude",
     terminal = {
-      provider = "native",
-      cwd = vim.fn.expand("~/brain"),
+      provider = require("olivier.terminal.tmux"),
+      provider_opts = {
+        split_direction = "vertical", -- "vertical" (side by side) or "horizontal" (stacked)
+        size = 40, -- percentage of screen
+        focus_on_open = true,
+      },
     },
     diff_opts = {
       auto_close_on_accept = true,
