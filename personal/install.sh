@@ -39,7 +39,7 @@ $RESET"
   # NOTE:- don't link nvm default-packages here, it will be linked in personal/custom.zsh
   # this is because nvm is installed after antigen is applied
 
-  install_with_brew pure fzf bat ripgrep grep watchman tmux withgraphite/tap/graphite aria2 tmuxinator neovim task fd
+  install_with_brew pure fzf bat ripgrep grep watchman tmux withgraphite/tap/graphite aria2 tmuxinator neovim tree-sitter-cli task fd
   install_with_brew --cask temurin
   install_with_brew --cask wezterm
   install_tpm
