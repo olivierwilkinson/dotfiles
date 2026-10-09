@@ -1,0 +1,27 @@
+# Work (Shopify) git settings. Included via includeIf from personal/.gitconfig
+# for repos under ~/world/ (work machine only — the directory doesn't exist
+# elsewhere, so this file is inert on other machines). No secrets: identity
+# and helper script paths only; the scripts themselves hold the credentials.
+
+[user]
+	name = Olivier Wilkinson
+	email = olivier.wilkinson@shopify.com
+
+[credential "https://*.quick.shopify.io"]
+	helper =
+	helper = /Users/olivier/.config/quick/quick-git-credential.sh
+[http "https://*.quick.shopify.io/"]
+	extraHeader = X-Requested-With: XMLHttpRequest
+
+[shop-world "stale-pr-cutoff"]
+	main = 1791424923
+
+[credential "https://github.com"]
+	helper =
+	helper = !/Users/olivier/.local/state/tec/toolchain/base_profile/bin/gh.unwrapped auth git-credential
+[credential "https://gist.github.com"]
+	helper =
+	helper = !/Users/olivier/.local/state/tec/toolchain/base_profile/bin/gh.unwrapped auth git-credential
+
+[maintenance]
+	repo = /Users/olivier/world/git

@@ -11,6 +11,10 @@
 [include]
     path = /Users/olivier/.config/dev/gitconfig
 
+# Work identity + Shopify helpers — only for repos under ~/world/ (work machine)
+[includeIf "gitdir/i:~/world/"]
+    path = ~/dotfiles/personal/.gitconfig-work
+
 [column]
     ui = auto
 
