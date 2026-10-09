@@ -14,7 +14,13 @@
 export NVM_LAZY_LOAD=true
 export NVM_COMPLETION=true
 export NVM_AUTO_USE=true
-export ZSH_TMUX_AUTOSTART=true
+# Don't auto-start tmux inside herdr panes — nested multiplexer breaks herdr's
+# agent detection (herdr injects HERDR_ENV=1 into its managed pane processes).
+if [[ ${HERDR_ENV:-} == 1 ]]; then
+  export ZSH_TMUX_AUTOSTART=false
+else
+  export ZSH_TMUX_AUTOSTART=true
+fi
 
 antigen bundle git
 antigen bundle z

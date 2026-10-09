@@ -1,0 +1,13 @@
+# herdr config — managed in dotfiles (personal/herdr/config.toml, symlinked
+# into ~/.config/herdr/). Runtime state (sockets, logs, sessions/) stays in
+# ~/.config/herdr/ itself and is never managed here.
+
+# Worker state signals route through the pi-subagents extension's Inbox /
+# ping_user system. herdr must never notify audibly or visually: no popups
+# (in-app, terminal, or OS notifications are all delivery modes of this key),
+# no sounds.
+[ui.toast]
+delivery = "off"
+
+[ui.sound]
+enabled = false
