@@ -1,6 +1,7 @@
 ---
 description: "Drafts ONE project's brain-doc update directly in the worktree brain-orchestrator assigned it, following the brain skills, and commits it on its branch. Leaf worker — the diff is the review gate."
 tools: read, bash, write, edit, complete_task
+model: fireworks-300k/fireworks:accounts/fireworks/routers/glm-5p3-flash
 thinking: medium
 spawning: false
 base-subagent: worker

@@ -1,6 +1,7 @@
 ---
 description: "The ONE reconciler of a brain-update pass — rebases each drafter branch onto the moving bank tip, auto-resolves only append-collisions and formatting, escalates everything semantic to brain-orchestrator, and hands branches back one at a time for integration. Leaf worker."
 tools: read, bash, write, edit, complete_task
+model: fireworks-300k/fireworks:accounts/fireworks/routers/glm-5p3-flash
 thinking: medium
 spawning: false
 base-subagent: worker
