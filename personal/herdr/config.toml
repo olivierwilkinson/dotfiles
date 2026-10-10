@@ -1,3 +1,4 @@
+onboarding = false
 # herdr config — managed in dotfiles (personal/herdr/config.toml, symlinked
 # into ~/.config/herdr/). Runtime state (sockets, logs, sessions/) stays in
 # ~/.config/herdr/ itself and is never managed here.
@@ -11,3 +12,8 @@ delivery = "off"
 
 [ui.sound]
 enabled = false
+
+[ui]
+status_indicators = "symbols"
+# Long workspace/tab labels (subagent titles) need more room than the default 36-column cap.
+sidebar_max_width = 52
