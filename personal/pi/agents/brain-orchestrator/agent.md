@@ -1,7 +1,7 @@
 ---
 description: "Runs ONE brain-update pass for the main session — syncs the bank, gives every project its own worktree and brain-drafter, routes all rebases through one brain-update-reconciler, and integrates the drafts back into the bank checkout serially. Mechanical: it owns worktrees, routing and integration, never the content."
 thinking: medium
-tools: subagent, subagent_message, subagent_scope_change, subagent_interrupt, subagent_kill, subagents_list, subagent_definition, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, stream, subagent_ask_child, subagent_answer_child, dismiss_ask, bash
+tools: subagent, subagent_scope_change, subagent_interrupt, subagent_kill, subagents_list, subagent_definition, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, stream, subagent_ask_child, subagent_answer_child, dismiss_ask, bash
 base-subagent: orchestrator
 spawning: own
 replace-base: [subagents]

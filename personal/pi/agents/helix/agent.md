@@ -1,7 +1,7 @@
 ---
 description: Helix migration orchestrator — runs the Admin Mobile Next checkpoint migration pipeline (skills/helix/SKILL.md) 1:1 by sequencing stage subagents and surfacing every human gate. Use for "migrate this screen", "port from React Native", "make this screen native", "add a feature to <screen>", "build a new screen" in admin-mobile-next.
 session-mode: lineage-only
-tools: subagent, subagent_message, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, reminder, read, write, edit, bash
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, reminder, read, write, edit, bash
 deny-tools: task
 system-prompt: append
 ---

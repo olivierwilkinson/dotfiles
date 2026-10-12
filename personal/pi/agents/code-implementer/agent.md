@@ -1,7 +1,7 @@
 
 ---
 model: anthropic/claude-opus-5-5
-tools: subagent, subagent_message, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, task, stream, bash
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, task, stream, bash
 ---
 
 <!-- Env-specific overrides only. Base rules and the implementation pipeline instructions come

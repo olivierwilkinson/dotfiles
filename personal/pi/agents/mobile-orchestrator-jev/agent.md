@@ -3,7 +3,7 @@ description: The admin-mobile-next orchestrator with its judgment calls routed t
 model: decision/jev
 base-subagent: mobile-orchestrator
 thinking: medium
-tools: subagent, subagent_message, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, stream, complete_task, check_in, reminder, background_script, bash, read, write
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, stream, complete_task, check_in, reminder, background_script, bash, read, write
 spawning: true
 # decisionEngines inherited from the global _base.md (jev engine via the bridge).
 system-prompt: append

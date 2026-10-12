@@ -2,7 +2,7 @@
 description: "Helix-fix: fixes one defect in an admin-mobile-next migration where a React Native reference app defines correct behavior. Runs TWO research stages first (code-researcher on the RN app = exact reference behavior spec; code-researcher on the native tree = the defect's location and mechanism), then continues the standard code-writer pipeline (code-planner → confirm → code-implementer → code-verifier → adversarial pair → APPROVE/CHANGES loop). Use when a binks/review/verification finding needs the RN ground truth established before anything is touched."
 thinking: medium
 base-subagent: code-writer
-tools: subagent, subagent_message, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, check_in, ask_parent, task, stream, bash
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, check_in, ask_parent, task, stream, bash
 ---
 
 <!-- Env-specific overrides only. Pipeline stage mechanics come from the bundled

@@ -219,16 +219,13 @@ function mapAnswers(answers, req) {
       ],
     };
   }
-  if (next === "check_in" && spawned) {
+  if (next === "check_in" && spawned && childId) {
     return {
       say: "Checking in on the running worker.",
       calls: [
         {
-          tool: "subagent_message",
-          args: {
-            ...(childId ? { id: childId } : { name: "Goal worker" }),
-            message: "Status check: how is the task going?",
-          },
+          tool: "subagent_ask_child",
+          args: { subagentId: childId, question: "Status check: how is the task going?" },
           reason: "jev selected check_in",
         },
       ],
