@@ -26,11 +26,12 @@ sidebar_max_width = 52
 # Sidebar rows: subagent spaces decompose into $layer (source · agent, bold) and
 # $lineage1/$lineage2 (stream + ancestors, dim, wrapped at sidebar_max_width - 4);
 # the long composite label is hidden for our workspaces only (contains " · ").
-# Agents rows: state + task, with the lineage underneath.
+# Agents rows: workspace (the pane's space) + agent name (display_agent) headline, state
+# text and lineage below. Tab token dropped: display_agent carries the task name now.
 [ui.sidebar.agents]
 row_gap = 0
 rows = [
-  [{ token = "state_icon", dim = false }, { token = "tab", dim = false }],
+  [{ token = "state_icon", dim = false }, "workspace", "agent"],
   ["state_text"],
   [{ token = "$lineage1", dim = true }],
   [{ token = "$lineage2", dim = true }],
