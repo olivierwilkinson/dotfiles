@@ -358,10 +358,12 @@ function mapAnswers(answers, req) {
   if (next === "spawn_worker") {
     // The goal is orchestrator-facing; the worker needs its work, not the
     // orchestration meta-instructions (waiting, converging, watch-demo holds).
-    const task =
-      "You are the worker: do the work below in one pass. Instructions about orchestrating, waiting, converging, or reporting upward are for your parent, not you — finish by calling subagent_done with your report.\n\n" +
-      goal.slice(0, 2000);
+    // The worker's own name leads, so a goal that splits work by worker
+    // number is self-identifying for each spawn.
     const name = `Worker ${workers.length + 1}`;
+    const task =
+      `You are ${name}: do the work below in one pass. Instructions about orchestrating, waiting, converging, or reporting upward are for your parent, not you — finish by calling subagent_done with your report.\n\n` +
+      goal.slice(0, 2000);
     return {
       say: `Spawning ${name} (${agentType}) for the goal.`,
       calls: [

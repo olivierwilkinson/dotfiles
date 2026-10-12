@@ -26,15 +26,17 @@ global `_base.md` `decisionEngines:` block, inherited by this agent), which:
    (`https://proxy.shopify.ai/vendors/typesafe/v1/systemone`, auth:
    `SHOPIFY_PROXY_AUTH_HEADER`/`SHOPIFY_PROXY_KEY`, then
    `PI_PROXY_AUTH_HEADER`/`PI_PROXY_API_KEY`, then the devx broker token).
-3. Maps the answers to concrete tool calls: spawn a worker with the goal,
-   wait (no calls; the child's completion wakes the loop), check in, or
-   report done via `subagent_done` and terminate.
+3. Maps the answers to concrete tool calls: spawn workers with the goal
+   (agents chosen from the request's roster; several may run in parallel or
+   sequence), wait (no calls; worker events wake the loop), check in on any
+   running worker, or report done via `subagent_done` converging every
+   worker's report, and terminate.
 
 ## Delegation policy
 
-- Coordinate only: the bridge spawns exactly one worker for the goal and
-  converges its report; reads, git operations and verification belong to the
-  worker.
+- Coordinate only: the bridge spawns workers for the goal and converges
+  their reports; reads, git operations and verification belong to the
+  workers.
 - The jev answers and full request diagnostics ride in each decision's
   `diagnostics` and the session `.decisions` audit sidecar.
 - Pinning: set `JEV_MODEL` (default `jev-latest`) in the engine `env` for

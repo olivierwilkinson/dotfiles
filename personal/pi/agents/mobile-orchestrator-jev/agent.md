@@ -81,32 +81,26 @@ Record every decision point you reach with its state payload, even when the engi
 yet bound — the record shape is the contract, and it is what makes the binding a
 configuration change rather than a rewrite.
 
-## The integration point — read this before assuming jev works
+## The integration point — the engine is bound and live
 
-The `command: jev` / `args: [--protocol=pi-decision-v1]` invocation in the frontmatter is
-the **placeholder shipped with the bundled `decision-orchestrator` agent**, carried here
-unchanged. The project's own verification pass records it as a deliberate placeholder:
-jev's real command line, arguments and protocol handshake are filled in when known, and
-no `jev` binary is on PATH in this environment. The decision *host* is proven end to end
-— the provider route was implemented and independently verified on the
-`ow-decision-orchestrator` branch of the subagents extension (503/503 unit, 5/5 decision
-integration, zero new failures) and the frontmatter path resolves a decision model in a
-spawned child at zero cost with no source edits — but the *engine* behind the id is not.
+The `decision/jev` model id resolves to the **jev-bridge stdio engine**
+(`decision-orchestrator/scripts/jev-bridge.mjs`, configured once in the
+global `_base.md` `decisionEngines:` block): TypeSafe System One via the
+Shopify AI Proxy, proven end to end through live orchestrator runs — spawn
+with agent-type selection from the roster, wait, dwell-reminder check-ins,
+child answers, completion wakes, and `subagent_done` convergence carrying
+the workers' real reports. Decisions cost $0.00 per the host's usage
+zeroing; the `<session>.decisions` sidecar is the audit log.
 
-Concretely, binding jev means exactly two things, and nothing in this file should be
-read as claiming either is done:
+What the bound engine covers today is **mechanical orchestration**: it
+spawns workers chosen from the session's roster (several in parallel or
+sequence), tracks each (`state.workers`), waits, checks in on any running
+worker, and converges every completed worker's report. The five
+decision points above are the roadmap for a domain battery (track/gate
+selection, retry-vs-escalate, attribution, sufficiency) — the record shape
+you keep logging is exactly what that battery will consume, so keep logging
+it.
 
-- Replace the placeholder `command`/`args` with jev's real stdio invocation, or switch
-  `transport` to `http` and set `url`. Everything else in the contract is already fixed.
-- Decide how the per-decision-point `state` above is populated on the request. The
-  contract carries an optional `state` map; how the pipeline's facts are keyed into it is
-  not specified by the project docs, and is part of the binding.
-
-Until both are settled, run this agent as the LLM orchestrator does, with one difference:
-reach the decision points explicitly, log each one's state payload and chosen outcome to
-the run log, and report that log. That log is the fixture set the binding is validated
-against.
-
-If the engine faults, the host's repair loop and breaker handle it — do not paper over a
-fault by deciding yourself. A tripped breaker is a terminal state to report upward, not a
-prompt to improvise.
+If the engine faults, the host's repair loop and breaker handle it — do not
+paper over a fault by deciding yourself. A tripped breaker is a terminal
+state to report upward, not a prompt to improvise.
