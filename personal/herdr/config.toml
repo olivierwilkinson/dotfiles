@@ -35,6 +35,8 @@ rows = [
   ["state_text"],
   [{ token = "$lineage1", dim = true }],
   [{ token = "$lineage2", dim = true }],
+  [{ token = "$lineage3", dim = true }],
+  [{ token = "$lineage4", dim = true }],
 ]
 
 [ui.sidebar.spaces]
