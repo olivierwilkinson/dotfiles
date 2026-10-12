@@ -82,6 +82,10 @@ function digestEvents(events) {
         };
       case "fault":
         return { kind: "fault", message: e.message.slice(0, 200) };
+      case "notification":
+        // The worker's completion notice and report pointer ride in the text — without it
+        // jev cannot see that delegated work finished.
+        return { kind: "notification", notification: e.kind, text: String(e.text ?? "").slice(0, OUTPUT_LIMIT) };
       default:
         return { kind: e.type };
     }
@@ -104,6 +108,29 @@ function spawnState(events) {
     }
   }
   return { spawned, childId, spawnFailed };
+}
+
+/**
+ * The worker's completion, from the subagent_result notification: verdict plus the full report,
+ * reading the store file the notice points at (falling back to the notice text). Null until one arrives.
+ */
+function workerResult(events) {
+  const notice = [...events]
+    .reverse()
+    .find((e) => e.type === "notification" && e.kind === "subagent_result");
+  if (!notice) return null;
+  const text = String(notice.text ?? "");
+  const verdict = /verdict:\s*(\w+)/.exec(text)?.[1] ?? null;
+  const stored = /Stored path:\s*(\S+)/.exec(text)?.[1];
+  let report = text;
+  if (stored) {
+    try {
+      report = readFileSync(stored, "utf8").slice(0, 4000);
+    } catch {
+      // store unreadable — the notice text still carries the essentials
+    }
+  }
+  return { verdict, report };
 }
 
 /** True once subagent_done has executed successfully — the run is over. */
@@ -136,6 +163,7 @@ function resolveGoal(events) {
 function buildRequest(req) {
   const goal = resolveGoal(req.events);
   const { spawned, childId, spawnFailed } = spawnState(req.events);
+  const result = workerResult(req.events);
   const doneCalled = doneAlreadyCalled(req.events);
   return {
     model: MODEL,
@@ -143,7 +171,14 @@ function buildRequest(req) {
       goal: goal.slice(0, 1000),
       agent_instructions: String(req.instructions ?? "").slice(0, 800),
       available_tools: req.tools.map((t) => t.name),
-      worker: { spawned, spawn_failed: spawnFailed, child_id: childId },
+      worker: {
+        spawned,
+        spawn_failed: spawnFailed,
+        child_id: childId,
+        completed: Boolean(result),
+        verdict: result?.verdict ?? null,
+        report: result?.report.slice(0, 2000) ?? null,
+      },
       done_already_reported: doneCalled,
       recent_events: digestEvents(req.events),
       run_state: req.state ?? null,
@@ -157,14 +192,14 @@ function buildRequest(req) {
       next_action: {
         type: "choice",
         instructions:
-          "What should the orchestrator do on this turn, given `state.goal`, `state.worker` (spawned / spawn_failed / child_id), and `state.recent_events`?",
+          "What should the orchestrator do on this turn, given `state.goal`, `state.worker` (spawned / completed / spawn_failed / child_id / verdict / report), and `state.recent_events`?",
         criteria: {
           spawn_worker:
             "No worker is running (`state.worker.spawned` is false — never spawned, or the spawn call failed and should be retried), or a worker finished and clearly more delegated work remains.",
           wait:
-            "A worker is running and its result has not arrived yet; the orchestrator should do nothing this turn.",
+            "A worker is running and its result has not arrived yet (`state.worker.completed` is false); the orchestrator should do nothing this turn.",
           report_done:
-            "The work is finished (or conclusively cannot proceed); report the outcome upward now.",
+            "The work is finished (`state.worker.completed` with a done verdict, or conclusively cannot proceed); report the outcome upward now.",
           check_in:
             "A running worker may be stuck or off-course; a brief status check to it is warranted.",
           other: "None of these describe the current situation.",
@@ -199,13 +234,19 @@ function mapAnswers(answers, req) {
   const { spawned, childId } = spawnState(req.events);
 
   if (done >= 0.5 || next === "report_done") {
+    // Converge: the report the parent receives is the worker's report, not a stub.
+    const result = workerResult(req.events);
+    const report = result?.report?.trim();
+    const converged = report
+      ? `Worker report (verdict: ${result.verdict ?? "unknown"}):\n${report}`
+      : `No worker report was received (jev: done=${done.toFixed(2)}, next=${next}).`;
     return {
       terminal: true,
       say: `Goal complete: ${goal.slice(0, 200)}`,
       calls: [
         {
           tool: "subagent_done",
-          args: { result: `Decision run finished (jev: done=${done.toFixed(2)}, next=${next}).` },
+          args: { result: converged },
           reason: "jev judged the goal achieved",
         },
       ],
