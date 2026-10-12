@@ -25,7 +25,7 @@ sidebar_max_width = 52
 [ui.sidebar.agents]
 row_gap = 0
 rows = [
-  [{ token = "state_icon" }, { token = "tab", dim = false }],
+  [{ token = "state_icon", dim = false }, { token = "tab", dim = false }],
   ["state_text"],
   [{ token = "$lineage1", dim = true }],
   [{ token = "$lineage2", dim = true }],
@@ -36,7 +36,6 @@ row_gap = 0
 rows = [
   ["state_icon",
    { token = "workspace", rules = [{ contains = " · ", hide = true }] },
-   { token = "$root" }],
+   { token = "$origin" }],
   [{ token = "$name", bold = true }],
-  [{ token = "$stream", dim = true }],
 ]
