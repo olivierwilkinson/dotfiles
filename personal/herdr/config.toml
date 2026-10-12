@@ -25,7 +25,8 @@ sidebar_max_width = 52
 [ui.sidebar.agents]
 row_gap = 1
 rows = [
-  ["state_icon", "state_text", "tab"],
+  ["state_icon", "tab"],
+  ["state_text"],
   [{ token = "$lineage1", dim = true }],
   [{ token = "$lineage2", dim = true }],
 ]
