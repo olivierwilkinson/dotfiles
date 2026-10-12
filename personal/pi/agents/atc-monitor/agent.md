@@ -2,7 +2,7 @@
 description: Long-running Shopify Mobile ATC monitor — schedules the five read-only checkers on a 5-minute cadence and escalates only real findings to the ATC session.
 model: anthropic/claude-sonnet-4-6
 session-mode: lineage-only
-tools: subagent, subagent_message, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, reminder, read, write, bash
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, reminder, read, write, bash
 deny-tools: edit, task
 system-prompt: append
 ---

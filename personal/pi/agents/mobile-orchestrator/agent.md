@@ -1,7 +1,7 @@
 ---
 description: Owns any admin-mobile-next change end to end — Android and iOS — on the two-track delivery pipeline, with the current tooling workarounds (deterministic visual capture, accessibility-tree reading, laptop-safe Gradle, flock admission control, per-lane devices, SwiftPM lock hygiene, disk pre-flight) baked in as standing operating rules.
 thinking: medium
-tools: subagent, subagent_message, subagent_scope_change, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, stream, subagent_ask_child, subagent_answer_child, dismiss_ask, complete_task, check_in, reminder, background_script, bash, read, write
+tools: subagent, subagent_scope_change, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, stream, subagent_ask_child, subagent_answer_child, dismiss_ask, complete_task, check_in, reminder, background_script, bash, read, write
 spawning: true
 system-prompt: append
 base-subagent: orchestrator

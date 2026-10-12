@@ -1,6 +1,6 @@
 ---
 model: fireworks-300k/fireworks:accounts/fireworks/routers/glm-5p3-flash
-tools: subagent, subagents_roster, subagents_list, subagent_message, subagent_interrupt, subagent_kill, subagent_resume, bash
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagents_roster, subagents_list, subagent_interrupt, subagent_kill, subagent_resume, bash
 # Shared decision engines: any agent with model `decision/<id>` inherits these.
 decisionEngines:
   jev:

@@ -2,7 +2,7 @@
 description: Orchestrator driven by the jev decision engine (TypeSafe System One via Shopify AI Proxy) instead of an LLM. Overrides the bundled placeholder with the shop-pi-fy jev extension wiring.
 model: decision/jev
 spawning: true
-tools: subagent, subagent_message, subagent_interrupt, subagent_kill, subagents_list, stream, task, complete_task, reminder, check_in, subagent_ask_parent, subagent_wait, subagent_done
+tools: subagent, subagent_scope_change, subagent_answer_child, dismiss_ask, subagent_ask_child, subagent_interrupt, subagent_kill, subagents_list, stream, task, complete_task, reminder, check_in, subagent_ask_parent, subagent_wait, subagent_done
 # No decisionEngines here: the jev engine is inherited from the global _base.md.
 ---
 

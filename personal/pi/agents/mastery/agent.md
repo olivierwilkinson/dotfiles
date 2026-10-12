@@ -1,7 +1,7 @@
 ---
 description: Talent mastery-cycle pipeline v2 for the user's self-reflection and peer reviews — field map from the live form, interview-first (shared-work context per question, monthly check-in state), pointed INDEX evidence sweeps, thin drafting in his register, structural voice flags, his edit-down + approval, then write-back via the talent scout.
 thinking: medium
-tools: subagent, subagent_message, subagent_interrupt, subagent_kill, subagents_list, task, stream, read, write, edit, check_in, ask_parent
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, task, stream, read, write, edit, check_in, ask_parent
 system-prompt: append
 ---
 

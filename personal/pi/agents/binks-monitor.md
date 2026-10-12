@@ -225,7 +225,7 @@ it with provider enumeration; a later wake will catch up.
 
 While the watch script runs, the orchestrator may act on the findings you streamed —
 spawning scouts and workers to fix auto-handleable ones — and message you the outcome
-per thread via `subagent_message`, e.g.
+per thread via `subagent_scope_change`, e.g.
 "thread <id> fixed in commit <sha>" or "thread <id> surfaced to user". You cannot know
 resolution outcomes yourself — record every outcome message against your tracked
 threads. They drive the final report's categorization: threads with a fix outcome are
