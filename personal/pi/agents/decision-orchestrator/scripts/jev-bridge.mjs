@@ -3,8 +3,12 @@
 //
 // Reads one pi-decision-v1 DecisionRequest JSON line on stdin, asks the jev
 // engine (TypeSafe System One via Shopify AI Proxy, using the shop-pi-fy jev
-// extension's request/auth code) a fixed question battery, maps the answers
-// to concrete tool calls, and writes one DecisionResult JSON line to stdout.
+// extension's request/auth code) a question battery, maps the answers to
+// concrete tool calls, and writes one DecisionResult JSON line to stdout.
+//
+// Mechanical orchestration only, like any orchestrator: it may spawn several
+// workers (agents chosen from the request's roster), wait, check in on any
+// running worker, and converge every worker's report into one subagent_done.
 //
 // Exit codes: 0 with a result line on success; non-zero on any fault (the
 // provider's fault/repair loop handles retries).
@@ -83,7 +87,7 @@ function digestEvents(events) {
       case "fault":
         return { kind: "fault", message: e.message.slice(0, 200) };
       case "notification":
-        // The worker's completion notice and report pointer ride in the text — without it
+        // Worker notices and report pointers ride in the text — without it
         // jev cannot see that delegated work finished.
         return { kind: "notification", notification: e.kind, text: String(e.text ?? "").slice(0, OUTPUT_LIMIT) };
       default:
@@ -92,48 +96,84 @@ function digestEvents(events) {
   });
 }
 
-/** Spawn status from tool results: a spawn only counts when the tool call SUCCEEDED. */
-function spawnState(events) {
-  let spawned = false;
-  let childId = null;
-  let spawnFailed = false;
+/** Spawn calls by callId, so a spawn tool result links back to its name/agent. */
+function callArgsById(events) {
+  const map = new Map();
   for (const e of events) {
-    if (e.type !== "tool_result" || e.tool !== "subagent") continue;
-    if (e.isError) {
-      spawnFailed = true;
-    } else {
-      spawned = true;
-      spawnFailed = false;
-      childId = /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1] ?? childId;
+    if (e.type === "decision" && Array.isArray(e.calls)) {
+      for (const c of e.calls) map.set(c.id, c);
     }
   }
-  return { spawned, childId, spawnFailed };
+  return map;
 }
 
 /**
- * The worker's completion, from the subagent_result notification: verdict plus the full report,
- * reading the store file the notice points at (falling back to the notice text). Null until one arrives.
+ * Every worker this orchestrator has spawned, with per-worker completion from
+ * the subagent_result notices (matched by the spawned name). A spawn only
+ * counts as running when its tool call succeeded; a failed spawn stays
+ * visible as spawn_failed so the engine can choose to retry.
  */
-function workerResult(events) {
-  const notice = [...events]
-    .reverse()
-    .find((e) => e.type === "notification" && e.kind === "subagent_result");
-  if (!notice) return null;
-  const text = String(notice.text ?? "");
-  // Workers that finish naturally (no subagent_done call) still report "completed";
-  // without an explicit verdict treat that as done, or convergence would depend
-  // on the child remembering to use the tool.
-  const verdict = /verdict:\s*(\w+)/.exec(text)?.[1] ?? (/completed/i.test(text) ? "done" : null);
-  const stored = /Stored path:\s*(\S+)/.exec(text)?.[1];
-  let report = text;
-  if (stored) {
-    try {
-      report = readFileSync(stored, "utf8").slice(0, 4000);
-    } catch {
-      // store unreadable — the notice text still carries the essentials
+function workersState(events) {
+  const calls = callArgsById(events);
+  const workers = new Map();
+  for (const e of events) {
+    if (e.type !== "tool_result" || e.tool !== "subagent") continue;
+    const call = calls.get(e.callId);
+    const name = String(call?.args?.name ?? "Goal worker");
+    if (e.isError) {
+      const w = workers.get(name);
+      if (w) {
+        w.running = false;
+        w.spawn_failed = true;
+      } else {
+        workers.set(name, {
+          name,
+          agent: call?.args?.agent ?? null,
+          child_id: null,
+          running: false,
+          spawn_failed: true,
+          completed: false,
+          verdict: null,
+          report: null,
+        });
+      }
+      continue;
     }
+    const childId = /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1] ?? null;
+    workers.set(name, {
+      name,
+      agent: call?.args?.agent ?? null,
+      child_id: childId,
+      running: childId !== null,
+      spawn_failed: false,
+      completed: false,
+      verdict: null,
+      report: null,
+    });
   }
-  return { verdict, report };
+  for (const e of events) {
+    if (e.type !== "notification" || e.kind !== "subagent_result") continue;
+    const w = workers.get(String(e.payload?.name ?? ""));
+    if (!w) continue;
+    w.running = false;
+    w.completed = true;
+    const text = String(e.text ?? "");
+    // Workers that finish naturally (no subagent_done call) still report
+    // "completed"; without an explicit verdict treat that as done, or
+    // convergence would depend on the child remembering to use the tool.
+    w.verdict = /verdict:\s*(\w+)/.exec(text)?.[1] ?? (/completed/i.test(text) ? "done" : null);
+    const stored = e.payload?.resultStorePath ?? /Stored path:\s*(\S+)/.exec(text)?.[1];
+    let report = text;
+    if (stored) {
+      try {
+        report = readFileSync(stored, "utf8");
+      } catch {
+        // store unreadable — the notice text still carries the essentials
+      }
+    }
+    w.report = report.slice(0, 4000);
+  }
+  return [...workers.values()];
 }
 
 /** True once subagent_done has executed successfully — the run is over. */
@@ -163,25 +203,83 @@ function resolveGoal(events) {
   return raw;
 }
 
+/** This session's structured spawn args (the `<session>.args.json` sidecar), for engines whose parent spawns them with an argsSchema. */
+function readSpawnArgs(sessionFile) {
+  if (!sessionFile) return null;
+  try {
+    const raw = readFileSync(`${sessionFile}.args.json`, "utf8").trim();
+    return raw ? raw.slice(0, 1500) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Worker-agent choices from the request roster; the generic trio when no roster is published. */
+function workerAgentQuestion(req) {
+  const roster = Array.isArray(req.roster) ? req.roster : [];
+  if (roster.length === 0) {
+    return {
+      type: "choice",
+      instructions:
+        "If a worker is spawned for `state.goal`, which agent type fits the work described there best?",
+      criteria: {
+        worker: "General doing: implementing, running commands, tests, builds, commits.",
+        scout: "Read-only checking: verifying claims, inspecting code or state, research.",
+        monitor: "Watching one resource over time and reporting on change.",
+        other: "None of these fit.",
+      },
+    };
+  }
+  const criteria = {};
+  for (const a of roster.slice(0, 30)) {
+    criteria[a.name] = String(a.description ?? `Agent ${a.name}.`).slice(0, 160);
+  }
+  criteria.other = "None of these fit.";
+  return {
+    type: "choice",
+    instructions:
+      "If a worker is spawned for `state.goal`, which agent from the roster fits the work best? Pick by exact name.",
+    criteria,
+  };
+}
+
+/** Which running worker a check-in goes to — only asked when there is more than one. */
+function checkInTargetQuestion(workers) {
+  const running = workers.filter((w) => w.running && w.child_id);
+  if (running.length <= 1) return undefined;
+  const criteria = {};
+  for (const w of running) criteria[w.name] = `Status-check the ${w.agent ?? "worker"} named ${w.name}.`;
+  criteria.none = "No check-in is needed.";
+  return {
+    type: "choice",
+    instructions: "Which running worker should this status check go to?",
+    criteria,
+  };
+}
+
 function buildRequest(req) {
   const goal = resolveGoal(req.events);
-  const { spawned, childId, spawnFailed } = spawnState(req.events);
-  const result = workerResult(req.events);
+  const workers = workersState(req.events);
   const doneCalled = doneAlreadyCalled(req.events);
+  const agentQuestion = workerAgentQuestion(req);
+  const targetQuestion = checkInTargetQuestion(workers);
   return {
     model: MODEL,
     state: {
       goal: goal.slice(0, 1000),
       agent_instructions: String(req.instructions ?? "").slice(0, 800),
       available_tools: req.tools.map((t) => t.name),
-      worker: {
-        spawned,
-        spawn_failed: spawnFailed,
-        child_id: childId,
-        completed: Boolean(result),
-        verdict: result?.verdict ?? null,
-        report: result?.report.slice(0, 2000) ?? null,
-      },
+      spawn_args: readSpawnArgs(req.agent?.sessionFile),
+      workers: workers.map((w) => ({
+        name: w.name,
+        agent: w.agent,
+        child_id: w.child_id,
+        running: w.running,
+        spawn_failed: w.spawn_failed,
+        completed: w.completed,
+        verdict: w.verdict,
+        report: w.report?.slice(0, 1500) ?? null,
+      })),
       done_already_reported: doneCalled,
       recent_events: digestEvents(req.events),
       run_state: req.state ?? null,
@@ -190,39 +288,43 @@ function buildRequest(req) {
       done: {
         type: "noul",
         instructions:
-          "Given `state.goal` and `state.recent_events` (including any completed child-agent reports), is the goal fully achieved with nothing important left to do?",
+          "Given `state.goal` and `state.recent_events` (including any completed worker reports in `state.workers`), is the goal fully achieved with nothing important left to do?",
       },
       next_action: {
         type: "choice",
         instructions:
-          "What should the orchestrator do on this turn, given `state.goal`, `state.worker` (spawned / completed / spawn_failed / child_id / verdict / report), and `state.recent_events`?",
+          "What should the orchestrator do on this turn, given `state.goal`, `state.workers` (name / agent / running / spawn_failed / completed / verdict / report) and `state.recent_events`?",
         criteria: {
           spawn_worker:
-            "No worker is running (`state.worker.spawned` is false — never spawned, or the spawn call failed and should be retried), or a worker finished and clearly more delegated work remains.",
+            "A piece of the goal's work has no worker yet (never spawned, or a spawn failed and should be retried), or a worker finished and clearly more delegated work remains. Multiple workers may run in parallel or sequence.",
           wait:
-            "A worker is running and its result has not arrived yet (`state.worker.completed` is false); the orchestrator should do nothing this turn.",
+            "Workers are running and not all of their results have arrived (`state.workers` still has `running: true`); the orchestrator should do nothing this turn.",
           report_done:
-            "The work is finished (`state.worker.completed` with a done verdict, or conclusively cannot proceed); report the outcome upward now.",
+            "All delegated work is finished (every spawned worker completed with done verdicts) or the goal conclusively cannot proceed; report the outcome upward now.",
           check_in:
             "A running worker may be stuck or off-course; a brief status check to it is warranted.",
           other: "None of these describe the current situation.",
         },
       },
-      worker_agent: {
-        type: "choice",
-        instructions:
-          "If a worker is spawned for `state.goal`, which agent type fits the work described there best?",
-        criteria: {
-          worker:
-            "General doing: implementing, running commands, tests, builds, commits.",
-          scout:
-            "Read-only checking: verifying claims, inspecting code or state, research.",
-          monitor: "Watching one resource over time and reporting on change.",
-          other: "None of these fit.",
-        },
-      },
+      worker_agent: agentQuestion,
+      ...(targetQuestion ? { check_in_target: targetQuestion } : {}),
     },
   };
+}
+
+/** One converged result from every completed worker's report. */
+function convergeReport(workers, done, next) {
+  const completed = workers.filter((w) => w.completed && w.report);
+  if (completed.length === 0) {
+    return `No worker reports were received (jev: done=${done.toFixed(2)}, next=${next}).`;
+  }
+  return completed
+    .map(
+      (w) =>
+        `Worker "${w.name}" (agent ${w.agent ?? "?"}, verdict ${w.verdict ?? "unknown"}):\n${w.report.trim()}`,
+    )
+    .join("\n\n---\n\n")
+    .slice(0, 4000);
 }
 
 function mapAnswers(answers, req) {
@@ -232,61 +334,65 @@ function mapAnswers(answers, req) {
   }
   const done = answers.done?.noul ?? 0;
   const next = answers.next_action?.choice ?? "other";
-  const agentType = answers.worker_agent?.choice === "other" ? "worker" : answers.worker_agent?.choice ?? "worker";
+  const agentType =
+    answers.worker_agent?.choice && answers.worker_agent.choice !== "other"
+      ? answers.worker_agent.choice
+      : "worker";
   const goal = resolveGoal(req.events);
-  const { spawned, childId } = spawnState(req.events);
+  const workers = workersState(req.events);
 
   if (done >= 0.5 || next === "report_done") {
-    // Converge: the report the parent receives is the worker's report, not a stub.
-    const result = workerResult(req.events);
-    const report = result?.report?.trim();
-    const converged = report
-      ? `Worker report (verdict: ${result.verdict ?? "unknown"}):\n${report}`
-      : `No worker report was received (jev: done=${done.toFixed(2)}, next=${next}).`;
+    // Converge: the report the parent receives is every worker's report, not a stub.
     return {
       terminal: true,
       say: `Goal complete: ${goal.slice(0, 200)}`,
       calls: [
         {
           tool: "subagent_done",
-          args: { result: converged },
+          args: { result: convergeReport(workers, done, next) },
           reason: "jev judged the goal achieved",
         },
       ],
     };
   }
-  if (next === "spawn_worker" && !spawned) {
+  if (next === "spawn_worker") {
     // The goal is orchestrator-facing; the worker needs its work, not the
     // orchestration meta-instructions (waiting, converging, watch-demo holds).
     const task =
       "You are the worker: do the work below in one pass. Instructions about orchestrating, waiting, converging, or reporting upward are for your parent, not you — finish by calling subagent_done with your report.\n\n" +
       goal.slice(0, 2000);
+    const name = `Worker ${workers.length + 1}`;
     return {
-      say: `Spawning a ${agentType} for the goal.`,
+      say: `Spawning ${name} (${agentType}) for the goal.`,
       calls: [
         {
           tool: "subagent",
-          args: { name: "Goal worker", agent: agentType, task, cwd: req.agent?.cwd ?? process.cwd() },
+          args: { name, agent: agentType, task, cwd: req.agent?.cwd ?? process.cwd() },
           reason: `jev selected spawn_worker/${agentType}`,
         },
       ],
     };
   }
-  if (next === "check_in" && spawned && childId) {
-    return {
-      say: "Checking in on the running worker.",
-      calls: [
-        {
-          tool: "subagent_ask_child",
-          args: { subagentId: childId, question: "Status check: how is the task going?" },
-          reason: "jev selected check_in",
-        },
-      ],
-    };
+  if (next === "check_in") {
+    const running = workers.filter((w) => w.running && w.child_id);
+    const chosen =
+      running.find((w) => w.name === answers.check_in_target?.choice) ?? running[0];
+    if (chosen) {
+      return {
+        say: `Checking in on ${chosen.name}.`,
+        calls: [
+          {
+            tool: "subagent_ask_child",
+            args: { subagentId: chosen.child_id, question: "Status check: how is the task going?" },
+            reason: "jev selected check_in",
+          },
+        ],
+      };
+    }
   }
-  // wait, or unmappable answers: end the turn without calls; child completion wakes the loop.
+  // wait, or unmappable answers: end the turn without calls; worker events wake the loop.
   return {
-    say: next === "wait" ? "Waiting for the running worker." : `Holding (jev: next=${next}).`,
+    say: next === "wait" ? "Waiting for the running workers." : `Holding (jev: next=${next}).`,
     calls: [],
   };
 }
