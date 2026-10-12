@@ -17,3 +17,25 @@ enabled = false
 status_indicators = "symbols"
 # Long workspace/tab labels (subagent titles) need more room than the default 36-column cap.
 sidebar_max_width = 52
+
+# Sidebar rows: subagent spaces decompose into $layer (source · agent, bold) and
+# $lineage1/$lineage2 (stream + ancestors, dim, wrapped at sidebar_max_width - 4);
+# the long composite label is hidden for our workspaces only (contains " · ").
+# Agents rows: state + task, with the lineage underneath.
+[ui.sidebar.agents]
+row_gap = 1
+rows = [
+  ["state_icon", "state_text", "tab"],
+  [{ token = "$lineage1", dim = true }],
+  [{ token = "$lineage2", dim = true }],
+]
+
+[ui.sidebar.spaces]
+row_gap = 1
+rows = [
+  ["state_icon",
+   { token = "workspace", rules = [{ contains = " · ", hide = true }] },
+   { token = "$layer", bold = true }],
+  [{ token = "$lineage1", dim = true }],
+  [{ token = "$lineage2", dim = true }],
+]
