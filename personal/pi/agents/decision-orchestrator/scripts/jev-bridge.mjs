@@ -120,7 +120,10 @@ function workerResult(events) {
     .find((e) => e.type === "notification" && e.kind === "subagent_result");
   if (!notice) return null;
   const text = String(notice.text ?? "");
-  const verdict = /verdict:\s*(\w+)/.exec(text)?.[1] ?? null;
+  // Workers that finish naturally (no subagent_done call) still report "completed";
+  // without an explicit verdict treat that as done, or convergence would depend
+  // on the child remembering to use the tool.
+  const verdict = /verdict:\s*(\w+)/.exec(text)?.[1] ?? (/completed/i.test(text) ? "done" : null);
   const stored = /Stored path:\s*(\S+)/.exec(text)?.[1];
   let report = text;
   if (stored) {
@@ -253,12 +256,17 @@ function mapAnswers(answers, req) {
     };
   }
   if (next === "spawn_worker" && !spawned) {
+    // The goal is orchestrator-facing; the worker needs its work, not the
+    // orchestration meta-instructions (waiting, converging, watch-demo holds).
+    const task =
+      "You are the worker: do the work below in one pass. Instructions about orchestrating, waiting, converging, or reporting upward are for your parent, not you — finish by calling subagent_done with your report.\n\n" +
+      goal.slice(0, 2000);
     return {
       say: `Spawning a ${agentType} for the goal.`,
       calls: [
         {
           tool: "subagent",
-          args: { name: "Goal worker", agent: agentType, task: goal.slice(0, 2000), cwd: req.agent?.cwd ?? process.cwd() },
+          args: { name: "Goal worker", agent: agentType, task, cwd: req.agent?.cwd ?? process.cwd() },
           reason: `jev selected spawn_worker/${agentType}`,
         },
       ],
