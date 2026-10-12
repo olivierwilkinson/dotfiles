@@ -7,6 +7,11 @@ onboarding = false
 # ping_user system. herdr must never notify audibly or visually: no popups
 # (in-app, terminal, or OS notifications are all delivery modes of this key),
 # no sounds.
+# Non-active Space names + Agents-row workspace names render at text brightness:
+# subtext0 is reassigned to catppuccin `text` (workspace-name tokens read subtext0).
+[theme.custom]
+subtext0 = "#cdd6f4"
+
 [ui.toast]
 delivery = "off"
 
