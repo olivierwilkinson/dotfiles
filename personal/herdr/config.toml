@@ -22,15 +22,10 @@ sidebar_max_width = 52
 # $lineage1/$lineage2 (stream + ancestors, dim, wrapped at sidebar_max_width - 4);
 # the long composite label is hidden for our workspaces only (contains " · ").
 # Agents rows: state + task, with the lineage underneath.
-[theme.custom]
-# Brighten herdr's secondary text to full text color — the Agents tab token renders
-# subtext by color, and row styles cannot reference theme tokens (hex only).
-subtext0 = "#cad3f5"
-
 [ui.sidebar.agents]
 row_gap = 0
 rows = [
-  [{ token = "state_icon", dim = false }, { token = "tab", dim = false }],
+  [{ token = "state_icon", dim = false }, { token = "tab", dim = false, fg = "#cad3f5" }],
   ["state_text"],
   [{ token = "$lineage1", dim = true }],
   [{ token = "$lineage2", dim = true }],
