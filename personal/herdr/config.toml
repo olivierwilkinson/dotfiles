@@ -37,6 +37,16 @@ rows = [
   [{ token = "$lineage2", dim = true }],
   [{ token = "$lineage3", dim = true }],
   [{ token = "$lineage4", dim = true }],
+  [{ token = "$lineage5", dim = true }],
+  [{ token = "$lineage6", dim = true }],
+  [{ token = "$lineage7", dim = true }],
+  [{ token = "$lineage8", dim = true }],
+  [{ token = "$lineage9", dim = true }],
+  [{ token = "$lineage10", dim = true }],
+  [{ token = "$lineage11", dim = true }],
+  [{ token = "$lineage12", dim = true }],
+  [{ token = "$lineage13", dim = true }],
+  [{ token = "$lineage14", dim = true }],
 ]
 
 [ui.sidebar.spaces]
