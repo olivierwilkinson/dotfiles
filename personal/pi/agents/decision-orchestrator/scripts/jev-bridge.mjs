@@ -183,6 +183,30 @@ function doneAlreadyCalled(events) {
   );
 }
 
+/** Failed subagent spawns at the tail of the events, broken by any successful spawn. */
+function trailingSpawnFailures(events) {
+  let n = 0;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type !== "tool_result" || e.tool !== "subagent") continue;
+    if (e.isError) n++;
+    else break;
+  }
+  return n;
+}
+
+/** Failure report for the mechanical spawn dead-end: the classifier cannot read the error's instructions, so the loop converges upward instead. */
+function spawnFailureReport(events, failures) {
+  const last = [...events]
+    .reverse()
+    .find((e) => e.type === "tool_result" && e.tool === "subagent" && e.isError);
+  const err = String(last?.output ?? "(no error text captured)").slice(0, 400);
+  return (
+    `Orchestrator aborted mechanically: ${failures} consecutive spawn attempts failed with no successful spawn between them. ` +
+    `The goal was NOT completed.\n\nGoal: ${resolveGoal(events).slice(0, 400)}\n\nLast spawn error: ${err}`
+  );
+}
+
 /** The goal text: the spawn's `PI_SUBAGENT_TASK` env when present (artifact handoff buries it in an expanded wrapper blob), else the first user/parent message. */
 function resolveGoal(events) {
   const fromEnv = process.env.PI_SUBAGENT_TASK?.trim();
@@ -214,9 +238,10 @@ function readSpawnArgs(sessionFile) {
   }
 }
 
-/** Worker-agent choices from the request roster; the generic trio when no roster is published. */
+/** Worker-agent choices from the request roster; the generic trio when no roster is published. The orchestrator's own agent is never offered — self-spawn is blocked upstream and picking it just burns retries. */
 function workerAgentQuestion(req) {
   const roster = Array.isArray(req.roster) ? req.roster : [];
+  const self = req.agent?.agentType ?? req.agent?.name ?? null;
   if (roster.length === 0) {
     return {
       type: "choice",
@@ -232,6 +257,7 @@ function workerAgentQuestion(req) {
   }
   const criteria = {};
   for (const a of roster.slice(0, 30)) {
+    if (self && a.name === self) continue;
     criteria[a.name] = String(a.description ?? `Agent ${a.name}.`).slice(0, 160);
   }
   criteria.other = "None of these fit.";
@@ -332,6 +358,22 @@ function mapAnswers(answers, req) {
   if (doneAlreadyCalled(req.events)) {
     return { terminal: true, say: "Already reported done; ending.", calls: [] };
   }
+  // Mechanical dead-end: repeated failed spawns never resolve by asking the
+  // classifier again (self-spawn blocks, bad agent choices, missing cwd).
+  const failures = trailingSpawnFailures(req.events);
+  if (failures >= 3) {
+    return {
+      terminal: true,
+      say: `${failures} consecutive spawns failed; reporting the failure upward.`,
+      calls: [
+        {
+          tool: "subagent_done",
+          args: { result: spawnFailureReport(req.events, failures) },
+          reason: "mechanical fallback after 3 consecutive spawn failures",
+        },
+      ],
+    };
+  }
   const done = answers.done?.noul ?? 0;
   const next = answers.next_action?.choice ?? "other";
   const agentType =
@@ -359,11 +401,23 @@ function mapAnswers(answers, req) {
     // The goal is orchestrator-facing; the worker needs its work, not the
     // orchestration meta-instructions (waiting, converging, watch-demo holds).
     // The worker's own name leads, so a goal that splits work by worker
-    // number is self-identifying for each spawn.
+    // number is self-identifying for each spawn. Completed workers' reports
+    // ride along — dependent pipelines (plan → implement) need the prior
+    // stage's output, and forwarding it is mechanical, not generative.
     const name = `Worker ${workers.length + 1}`;
+    const prior = workers.filter((w) => w.completed && w.report);
+    const priorBlock =
+      prior.length > 0
+        ? "\n\nPrior completed worker reports (use them; do not redo that work):\n" +
+          prior
+            .map((w) => `— ${w.name} (${w.agent ?? "?"}):
+${w.report.trim().slice(0, 1500)}`)
+            .join("\n\n")
+        : "";
     const task =
       `You are ${name}: do the work below in one pass. Instructions about orchestrating, waiting, converging, or reporting upward are for your parent, not you — finish by calling subagent_done with your report.\n\n` +
-      goal.slice(0, 2000);
+      goal.slice(0, 2000) +
+      priorBlock.slice(0, 4000);
     return {
       say: `Spawning ${name} (${agentType}) for the goal.`,
       calls: [
