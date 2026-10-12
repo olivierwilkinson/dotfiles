@@ -23,7 +23,7 @@ sidebar_max_width = 52
 # the long composite label is hidden for our workspaces only (contains " · ").
 # Agents rows: state + task, with the lineage underneath.
 [ui.sidebar.agents]
-row_gap = 1
+row_gap = 0
 rows = [
   [{ token = "state_icon" }, { token = "tab", dim = false }],
   ["state_text"],
@@ -32,11 +32,11 @@ rows = [
 ]
 
 [ui.sidebar.spaces]
-row_gap = 1
+row_gap = 0
 rows = [
   ["state_icon",
    { token = "workspace", rules = [{ contains = " · ", hide = true }] },
-   { token = "$layer", bold = true }],
-  [{ token = "$lineage1", dim = true }],
-  [{ token = "$lineage2", dim = true }],
+   { token = "$root" }],
+  [{ token = "$name", bold = true }],
+  [{ token = "$stream", dim = true }],
 ]
