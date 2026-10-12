@@ -29,6 +29,15 @@ $RESET"
     link_config ~/dotfiles/personal/pi/subagents-config ~/.pi/agent/config/subagents
   fi
 
+  # herdr: link the config FILE only (runtime state lives in ~/.config/herdr itself),
+  # and link the pi-subagents sidebar plugin from the extension checkout when present.
+  if command -v herdr >/dev/null 2>&1; then
+    mkdir -p $HOME/.config/herdr
+    ln -sf ~/dotfiles/personal/herdr/config.toml $HOME/.config/herdr/config.toml
+    local plugin=~/.pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/herdr-plugin
+    [[ -d $plugin ]] && herdr plugin link "$plugin" >/dev/null 2>&1 || true
+  fi
+
   # Work git identity gate — exists only on the Shopify work machine (dev toolchain)
   if [[ -d /opt/dev ]]; then
     mkdir -p $HOME/.config/git
