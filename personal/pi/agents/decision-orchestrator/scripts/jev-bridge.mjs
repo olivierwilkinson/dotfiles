@@ -113,11 +113,15 @@ function doneAlreadyCalled(events) {
   );
 }
 
-/** The goal text: the first user/parent message, resolving `@artifact` handoffs. */
+/** The goal text: the spawn's `PI_SUBAGENT_TASK` env when present (artifact handoff buries it in an expanded wrapper blob), else the first user/parent message. */
 function resolveGoal(events) {
+  const fromEnv = process.env.PI_SUBAGENT_TASK?.trim();
+  if (fromEnv) return fromEnv.slice(0, 4000);
   const raw =
     events.find((e) => e.type === "user_input")?.text ??
-    events.find((e) => e.type === "parent_message")?.text ??
+    events.find(
+      (e) => e.type === "parent_message" || (e.type === "notification" && e.kind === "parent_message"),
+    )?.text ??
     "(no goal message)";
   if (raw.startsWith("@")) {
     try {
