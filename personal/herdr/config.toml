@@ -26,7 +26,6 @@ sidebar_max_width = 52
 # Brighten herdr's secondary text to full text color — the Agents tab token renders
 # subtext by color, and row styles cannot reference theme tokens (hex only).
 subtext0 = "#cad3f5"
-subtext1 = "#cad3f5"
 
 [ui.sidebar.agents]
 row_gap = 0
