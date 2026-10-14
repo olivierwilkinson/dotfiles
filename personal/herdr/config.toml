@@ -58,4 +58,5 @@ rows = [
    { token = "workspace", rules = [{ contains = " · ", hide = true }] },
    { token = "$origin" }],
   [{ token = "$name", bold = true }],
+  [{ token = "$gap" }],
 ]
