@@ -26,14 +26,13 @@ sidebar_max_width = 52
 # Sidebar rows: subagent spaces decompose into $layer (source · agent, bold) and
 # $lineage1/$lineage2 (stream + ancestors, dim, wrapped at sidebar_max_width - 4);
 # the long composite label is hidden for our workspaces only (contains " · ").
-# Agents rows: workspace (the pane's space) headline, state text, then the subagent's
-# `(type) name` ($identity, pi-subagents panes only) and its lineage as `> ` lines, nearest
-# ancestor first, ending at the root session `root:stream`.
+# Agents rows: `<icon> <space> · <status>` headline (herdr joins a row's tokens with " · "),
+# then the subagent's `(type) name` ($identity, pi-subagents panes only) and its lineage as
+# `> ` lines, nearest ancestor first, ending at the root session `root:stream`.
 [ui.sidebar.agents]
 row_gap = 0
 rows = [
-  [{ token = "state_icon", dim = false }, "workspace"],
-  ["state_text"],
+  [{ token = "state_icon", dim = false }, "workspace", "state_text"],
   [{ token = "$identity" }],
   [{ token = "$lineage1", dim = true }],
   [{ token = "$lineage2", dim = true }],
