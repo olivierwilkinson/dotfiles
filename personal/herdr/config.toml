@@ -25,16 +25,14 @@ sidebar_max_width = 52
 
 # Sidebar rows: subagent spaces are labelled `<root> · <name>`, one plain row; a fresh
 # space's transient lineage-key label (prefixed "⋯" by pi-subagents) is hidden until renamed.
-# Agents rows: `<icon> <space>` headline (herdr joins a row's tokens with " · "), then the
-# status line, then the subagent's `(type) name` ($identity, pi-subagents panes only, slightly
-# dimmer white than the workspace name) and its lineage as `> ` lines, nearest ancestor first,
-# ending at the root session `root:stream`.
+# Agents rows: `<icon> (type) name` headline in the workspace white (herdr joins a row's tokens
+# with " · "), then the status line, then the agent's lineage as `> ` lines, nearest ancestor
+# first, ending at the root session `root:stream`. The space name lives in the Spaces pane.
 [ui.sidebar.agents]
 row_gap = 0
 rows = [
-  [{ token = "state_icon", dim = false }, "workspace"],
+  [{ token = "state_icon", dim = false }, { token = "$identity", fg = "#cdd6f4" }],
   [{ token = "state_text" }],
-  [{ token = "$identity", fg = "#bac2de" }],
   [{ token = "$lineage1", dim = true }],
   [{ token = "$lineage2", dim = true }],
   [{ token = "$lineage3", dim = true }],
