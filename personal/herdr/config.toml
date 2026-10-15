@@ -51,6 +51,6 @@ rows = [
 [ui.sidebar.spaces]
 row_gap = 0
 rows = [
-  ["state_icon", { token = "workspace", rules = [{ starts_with = "⋯", hide = true }] }],
+  ["state_icon", { token = "workspace", rules = [{ starts_with = "⋯", hide = true }, { starts_with = "\u200B", fg = "#bac2de" }] }],
   [{ token = "$gap" }],
 ]
