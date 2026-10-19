@@ -12,6 +12,10 @@
 //
 // Exit codes: 0 with a result line on success; non-zero on any fault (the
 // provider's fault/repair loop handles retries).
+//
+// Staleness: a stdio engine process is long-lived per session and pins this
+// bridge's code at its first decision; bridge updates only reach NEW sessions
+// (live sessions keep the pre-update bridge until they end).
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
@@ -348,8 +352,10 @@ function unconsumedThinker(workers, asks) {
 }
 
 /** B3: route an escalation upward by capability — root Inbox row, parent ask,
- *  or a terminal NOT-completed report the LLM parent must surface. */
-function escalateAction(req, { key, title, body, markerAskId }) {
+ *  or a terminal NOT-completed report the LLM parent must surface. A
+ *  forwarded ask's answer auto-chains to the asking child without waking this
+ *  session (the child's subagent_done converges the run). */
+function escalateAction(req, { key, title, body, markerAskId, forwardAskId = null }) {
   const marker = markerAskId ? `escalation_for: ${markerAskId}` : null;
   if (req.tools.some((t) => t.name === "escalate")) {
     return {
@@ -378,6 +384,9 @@ function escalateAction(req, { key, title, body, markerAskId }) {
           tool: "subagent_ask_parent",
           args: {
             question: `ESCALATION REQUEST (needs the user)${marker ? ` — ${marker}` : ""}: ${title}\n\n${body}`,
+            ...(forwardAskId
+              ? { forwardAskId, message: `Child ask ${forwardAskId} forwarded: ${title}` }
+              : {}),
           },
           reason: "pending ask/blocker escalated to the parent for the user",
         },
@@ -696,7 +705,45 @@ export function mapAnswers(answers, req) {
       title: `Pending child ask ${thinker.ask.askId} from "${thinker.ask.from}" needs the user`,
       body: escalationBody([thinker.ask], blockers, `Thinker's finding:\n${finding}`),
       markerAskId: thinker.ask.askId,
+      forwardAskId: thinker.ask.askId,
     });
+  }
+
+  // E1: every pending child ask routes ONCE per askId through the thinker —
+  // mechanical, not battery-gated (2026-10-19 live failure: the battery chose
+  // escalate and the ask never reached a thinker). B3 below remains the route
+  // when this session cannot spawn (leaf jev session).
+  if (asks.length > 0 && canSpawn) {
+    const ask = asks[0];
+    if (thinkerDispatched(req.events, ask.askId)) {
+      return { say: "Thinker already dispatched; waiting for its report.", calls: [] };
+    }
+    const name = `thinker-${ask.askId}`;
+    const task =
+      `thinker_for: ${ask.askId}\n\n` +
+      `A child of this orchestrator is blocked on a pending ask; reason about it beyond mechanical routing.\n\n` +
+      `Pending ask ${ask.askId} from "${ask.from}":\n${ask.text}\n\n` +
+      `Decision state (the same budgeted picture the orchestrator's engine sees):\n\n${decisionStateText(req, goal, workers)}\n\n` +
+      `Decide: answer the asking child yourself, or surface the matter to the user. Return exactly one fenced JSON block:\n` +
+      '```json\n{"kind": "response" | "escalation_request", "text": "...", "reasoning": "..."}\n```\n' +
+      `For kind "response", text is the answer delivered verbatim to the asking child. For kind "escalation_request", text is what the user must see.`;
+    return {
+      say: `Dispatching the thinker for ask ${ask.askId}.`,
+      calls: [
+        {
+          tool: "subagent",
+          args: {
+            name,
+            agent: "thinker",
+            thinking: "medium",
+            model: "fireworks-300k/fireworks:accounts/fireworks/models/glm-5p3",
+            task,
+            cwd: req.agent?.cwd ?? process.cwd(),
+          },
+          reason: "pending ask routed to the thinker once",
+        },
+      ],
+    };
   }
 
   // B3: pending asks and dead-end blockers reach the user by capability.
@@ -713,6 +760,9 @@ export function mapAnswers(answers, req) {
         : "Decision orchestrator blocked by spawn failures",
       body: escalationBody(asks, blockers),
       markerAskId: ask?.askId ?? null,
+      // Multi-ask: forward asks[0] only (the ask the key/marker names); the
+      // remaining asks stay pending locally.
+      forwardAskId: ask?.askId ?? null,
     });
   }
 
@@ -768,40 +818,9 @@ export function mapAnswers(answers, req) {
       ],
     };
   }
-  // E1: a pending ask routes once through the thinker with the same budgeted
-  // decision state jev sees (E3: one dispatch per askId, ever).
-  if (next === "think" && asks.length > 0 && canSpawn) {
-    const ask = asks[0];
-    if (thinkerDispatched(req.events, ask.askId)) {
-      return { say: "Thinker already dispatched; waiting for its report.", calls: [] };
-    }
-    const name = `thinker-${ask.askId}`;
-    const task =
-      `thinker_for: ${ask.askId}\n\n` +
-      `A child of this orchestrator is blocked on a pending ask; reason about it beyond mechanical routing.\n\n` +
-      `Pending ask ${ask.askId} from "${ask.from}":\n${ask.text}\n\n` +
-      `Decision state (the same budgeted picture the orchestrator's engine sees):\n\n${decisionStateText(req, goal, workers)}\n\n` +
-      `Decide: answer the asking child yourself, or surface the matter to the user. Return exactly one fenced JSON block:\n` +
-      '```json\n{"kind": "response" | "escalation_request", "text": "...", "reasoning": "..."}\n```\n' +
-      `For kind "response", text is the answer delivered verbatim to the asking child. For kind "escalation_request", text is what the user must see.`;
-    return {
-      say: `Dispatching the thinker for ask ${ask.askId}.`,
-      calls: [
-        {
-          tool: "subagent",
-          args: {
-            name,
-            agent: "thinker",
-            thinking: "medium",
-            task,
-            cwd: req.agent?.cwd ?? process.cwd(),
-          },
-          reason: "pending ask routed to the thinker once",
-        },
-      ],
-    };
-  }
-
+  // E1 now lives above the B3 escalate arm: pending asks route through the
+  // thinker mechanically whenever the session can spawn (E3: one dispatch per
+  // askId, ever), regardless of the battery's escalate/wait lean.
   if (next === "spawn_worker") {
     // The goal is orchestrator-facing; the worker needs its work, not the
     // orchestration meta-instructions (waiting, converging, watch-demo holds).
