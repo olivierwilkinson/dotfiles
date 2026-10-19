@@ -15,13 +15,16 @@
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createJiti } from "@mariozechner/jiti";
 
 const JEV_EXTENSION =
   "/Users/olivier/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/index.ts";
 const MODEL = process.env.JEV_MODEL || "jev-latest";
 const OUTPUT_LIMIT = 400;
+// Parent-authored text (goals, mid-run parent messages) rides at 2000 so the
+// actionable tail survives (A3); tool/notification output stays at 400.
+const TEXT_LIMIT = 2000;
 
 function fail(message) {
   process.stderr.write(`jev-bridge: ${message}\n`);
@@ -64,13 +67,13 @@ function readStdinLines(onLine) {
   });
 }
 
-function digestEvents(events) {
+export function digestEvents(events) {
   return events.slice(-30).map((e) => {
     switch (e.type) {
       case "user_input":
       case "parent_message":
       case "reminder":
-        return { kind: e.type, text: String(e.text).slice(0, 400) };
+        return { kind: e.type, text: String(e.text).slice(0, TEXT_LIMIT) };
       case "decision":
         return {
           kind: "decision",
@@ -135,6 +138,7 @@ function workersState(events) {
           completed: false,
           verdict: null,
           report: null,
+          report_path: null,
         });
       }
       continue;
@@ -149,6 +153,7 @@ function workersState(events) {
       completed: false,
       verdict: null,
       report: null,
+      report_path: null,
     });
   }
   for (const e of events) {
@@ -172,8 +177,241 @@ function workersState(events) {
       }
     }
     w.report = report.slice(0, 4000);
+    w.report_path = stored ?? null;
   }
   return [...workers.values()];
+}
+
+/** D2: `<session>.workers.json` persists worker rows past the 200-message
+ *  transcript window (same sidecar pattern as `.args.json`/`.ledger.json`).
+ *  Every build pass merges event-derived rows onto the ledger (events win) and
+ *  persists the merge; failure falls back to event-derived rows only. */
+export function mergedWorkers(sessionFile, events) {
+  const derived = workersState(events);
+  const merged = new Map();
+  if (sessionFile) {
+    try {
+      const rows = JSON.parse(readFileSync(`${sessionFile}.workers.json`, "utf8"));
+      if (Array.isArray(rows)) {
+        for (const w of rows) if (w && typeof w.name === "string") merged.set(w.name, w);
+      }
+    } catch {
+      // unreadable ledger — event-derived rows still drive this turn
+    }
+  }
+  for (const w of derived) merged.set(w.name, { ...merged.get(w.name), ...w });
+  const rows = [...merged.values()];
+  if (sessionFile) {
+    try {
+      writeFileSync(`${sessionFile}.workers.json`, `${JSON.stringify(rows, null, 2)}\n`, "utf8");
+    } catch {
+      // best-effort persist — the merge still serves this decision
+    }
+  }
+  return rows;
+}
+
+/** D1: outstanding-work lines never budgeted away, whatever the slice. */
+const OUTSTANDING_LINE = /\b(approv\w*|review\w*|outstanding|blocked|not (obtained|completed))\b/i;
+
+function outstandingLines(report) {
+  return String(report)
+    .split("\n")
+    .filter((line) => OUTSTANDING_LINE.test(line))
+    .map((line) => line.slice(0, 400));
+}
+
+/** D1: all rows always; the 3 most recent completed reports in full, older ones
+ *  head-cut with a store pointer — and outstanding-work lines always kept. */
+export function budgetWorkerRows(workers) {
+  const completedAt = [];
+  workers.forEach((w, i) => {
+    if (w.completed && w.report) completedAt.push(i);
+  });
+  const full = new Set(completedAt.slice(-3));
+  return workers.map((w, i) => {
+    const row = {
+      name: w.name,
+      agent: w.agent,
+      child_id: w.child_id,
+      running: w.running,
+      spawn_failed: w.spawn_failed,
+      completed: w.completed,
+      verdict: w.verdict,
+      report_path: w.report_path ?? null,
+      report: null,
+    };
+    if (!w.completed || !w.report) return row;
+    if (full.has(i)) {
+      row.report = String(w.report).slice(0, 4000);
+      return row;
+    }
+    const report = String(w.report);
+    const kept = outstandingLines(report);
+    row.report =
+      report.slice(0, 400) +
+      (kept.length > 0 ? `\n[outstanding work kept from the full report]\n${kept.join("\n")}` : "") +
+      (row.report_path ? `\n[full report: ${row.report_path}]` : "");
+    return row;
+  });
+}
+
+/** B1: child→parent asks still unanswered — `ask` notifications minus later
+ *  `answer` notifications, this bridge's own answer/dismiss calls. */
+export function pendingAsks(events) {
+  const asks = new Map();
+  for (const e of events) {
+    if (e.type === "notification" && e.kind === "ask") {
+      const askId = String(e.payload?.askId ?? "");
+      if (askId) {
+        asks.set(askId, {
+          askId,
+          from: String(e.payload?.name ?? e.payload?.agent ?? "child"),
+          text: String(e.payload?.question ?? e.text ?? "").slice(0, 1500),
+        });
+      }
+    } else if (e.type === "notification" && e.kind === "answer") {
+      asks.delete(String(e.payload?.askId ?? ""));
+    } else if (e.type === "decision" && Array.isArray(e.calls)) {
+      for (const c of e.calls) {
+        if (c?.tool === "subagent_answer_child" || c?.tool === "dismiss_ask") {
+          asks.delete(String(c.args?.askId ?? ""));
+        }
+      }
+    }
+  }
+  return [...asks.values()];
+}
+
+/** E1/E3 and B3 one-shot markers: prior subagent/ask_parent calls carrying
+ *  `thinker_for: <askId>` / `escalation_for: <askId>` in their task/question. */
+function dispatchedWithMarker(events, tool, marker) {
+  return events.some(
+    (e) =>
+      e.type === "decision" &&
+      Array.isArray(e.calls) &&
+      e.calls.some((c) => {
+        if (c?.tool !== tool) return false;
+        const text = String(c.args?.task ?? c.args?.question ?? "");
+        return text.includes(marker);
+      }),
+  );
+}
+
+function thinkerDispatched(events, askId) {
+  return dispatchedWithMarker(events, "subagent", `thinker_for: ${askId}`);
+}
+
+function escalationSent(events, askId) {
+  return (
+    dispatchedWithMarker(events, "subagent_ask_parent", `escalation_for: ${askId}`) ||
+    events.some(
+      (e) =>
+        e.type === "decision" &&
+        Array.isArray(e.calls) &&
+        e.calls.some((c) => c?.tool === "escalate" && String(c.args?.key ?? "") === askId),
+    )
+  );
+}
+
+/** E2: the thinker's verdict — first JSON object in the report, prose tolerated. */
+export function parseThinkerReport(report) {
+  const text = String(report);
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first === -1 || last <= first) return null;
+  try {
+    const parsed = JSON.parse(text.slice(first, last + 1));
+    if (
+      parsed &&
+      (parsed.kind === "response" || parsed.kind === "escalation_request") &&
+      typeof parsed.text === "string"
+    ) {
+      return parsed;
+    }
+  } catch {
+    // fall through — unparsable is an escalation, never a re-think (E3)
+  }
+  return null;
+}
+
+/** E2: the first completed thinker worker whose target ask is still pending. */
+function unconsumedThinker(workers, asks) {
+  for (const w of workers) {
+    if (w.agent !== "thinker" || !w.completed || !w.report) continue;
+    if (!w.name.startsWith("thinker-")) continue;
+    const askId = w.name.slice("thinker-".length);
+    const ask = asks.find((a) => a.askId === askId);
+    if (ask) return { worker: w, ask };
+  }
+  return null;
+}
+
+/** B3: route an escalation upward by capability — root Inbox row, parent ask,
+ *  or a terminal NOT-completed report the LLM parent must surface. */
+function escalateAction(req, { key, title, body, markerAskId }) {
+  const marker = markerAskId ? `escalation_for: ${markerAskId}` : null;
+  if (req.tools.some((t) => t.name === "escalate")) {
+    return {
+      say: `Escalating to the user's Inbox: ${title}`,
+      calls: [
+        {
+          tool: "escalate",
+          args: {
+            update: true,
+            key,
+            // Inbox caps: title 60, summary 80 (a long askId must not fault the call).
+            title: title.slice(0, 60),
+            summary: title.slice(0, 80),
+            description: `${body}${marker ? `\n\n${marker}` : ""}`,
+          },
+          reason: "pending ask/blocker escalated to the user's Inbox",
+        },
+      ],
+    };
+  }
+  if (req.tools.some((t) => t.name === "subagent_ask_parent")) {
+    return {
+      say: `Escalating to the parent: ${title}`,
+      calls: [
+        {
+          tool: "subagent_ask_parent",
+          args: {
+            question: `ESCALATION REQUEST (needs the user)${marker ? ` — ${marker}` : ""}: ${title}\n\n${body}`,
+          },
+          reason: "pending ask/blocker escalated to the parent for the user",
+        },
+      ],
+    };
+  }
+  return {
+    terminal: true,
+    say: `Escalating upward (terminal): ${title}`,
+    calls: [
+      {
+        tool: "subagent_done",
+        args: {
+          result:
+            `ESCALATION REQUEST${marker ? ` (${marker})` : ""}: ${title}\n\n` +
+            `Goal was NOT completed — this result needs the user's attention, not a merge.\n\n${body}`,
+        },
+        reason: "no escalate/ask_parent capability; terminal escalation report",
+      },
+    ],
+  };
+}
+
+/** The escalation body: every pending ask and dead-end blocker, in full enough. */
+function escalationBody(asks, blockers, extra) {
+  const parts = [];
+  for (const a of asks) parts.push(`Pending ask ${a.askId} from "${a.from}":\n${a.text}`);
+  for (const b of blockers) {
+    parts.push(
+      `Dead-end blocker: worker "${b.name}" (agent ${b.agent ?? "?"}) could not be spawned and no retry has succeeded.`,
+    );
+  }
+  if (extra) parts.push(extra);
+  return parts.join("\n\n") || "(nothing pending)";
 }
 
 /** True once subagent_done has executed successfully — the run is over. */
@@ -207,10 +445,10 @@ function spawnFailureReport(events, failures) {
   );
 }
 
-/** The goal text: the spawn's `PI_SUBAGENT_TASK` env when present (artifact handoff buries it in an expanded wrapper blob), else the first user/parent message. */
-function resolveGoal(events) {
+/** The goal text: the spawn's `PI_SUBAGENT_TASK` env when present (artifact handoff buries it in an expanded wrapper blob), else the first user/parent message. A1: the env text is memory-only and carries in full — the old 1000/4000 silent cuts hid the actionable half of the 2026-10-19 goal. */
+export function resolveGoal(events) {
   const fromEnv = process.env.PI_SUBAGENT_TASK?.trim();
-  if (fromEnv) return fromEnv.slice(0, 4000);
+  if (fromEnv) return fromEnv;
   const raw =
     events.find((e) => e.type === "user_input")?.text ??
     events.find(
@@ -283,29 +521,47 @@ function checkInTargetQuestion(workers) {
   };
 }
 
-function buildRequest(req) {
+/** A1: `state.goal` carries the first 4000 chars; anything longer lands whole
+ *  in a `<session>.goal.txt` sidecar with an explicit pointer — never a silent
+ *  cut (without a sidecar path the goal rides whole instead). */
+export function goalForState(goal, sessionFile) {
+  if (goal.length <= 4000 || !sessionFile) return { goal, path: null, truncated: false };
+  const path = `${sessionFile}.goal.txt`;
+  try {
+    writeFileSync(path, goal, "utf8");
+  } catch {
+    return { goal, path: null, truncated: false }; // unwritable sidecar — carry the goal whole
+  }
+  return {
+    goal: `${goal.slice(0, 4000)}\n[goal truncated — full text at ${path}]`,
+    path,
+    truncated: true,
+  };
+}
+
+export function buildRequest(req) {
   const goal = resolveGoal(req.events);
-  const workers = workersState(req.events);
+  const workers = mergedWorkers(req.agent?.sessionFile, req.events);
+  const asks = pendingAsks(req.events);
+  const carriers = goalForState(goal, req.agent?.sessionFile);
   const doneCalled = doneAlreadyCalled(req.events);
   const agentQuestion = workerAgentQuestion(req);
   const targetQuestion = checkInTargetQuestion(workers);
   return {
     model: MODEL,
     state: {
-      goal: goal.slice(0, 1000),
+      goal: carriers.goal,
+      ...(carriers.truncated
+        ? { goal_full_path: carriers.path, goal_truncated: true }
+        : {}),
       agent_instructions: String(req.instructions ?? "").slice(0, 800),
       available_tools: req.tools.map((t) => t.name),
       spawn_args: readSpawnArgs(req.agent?.sessionFile),
-      workers: workers.map((w) => ({
-        name: w.name,
-        agent: w.agent,
-        child_id: w.child_id,
-        running: w.running,
-        spawn_failed: w.spawn_failed,
-        completed: w.completed,
-        verdict: w.verdict,
-        report: w.report?.slice(0, 1500) ?? null,
-      })),
+      workers: budgetWorkerRows(workers),
+      pending_asks: asks,
+      blockers: workers
+        .filter((w) => w.spawn_failed)
+        .map((w) => ({ name: w.name, agent: w.agent })),
       done_already_reported: doneCalled,
       recent_events: digestEvents(req.events),
       run_state: req.state ?? null,
@@ -319,7 +575,7 @@ function buildRequest(req) {
       next_action: {
         type: "choice",
         instructions:
-          "What should the orchestrator do on this turn, given `state.goal`, `state.workers` (name / agent / running / spawn_failed / completed / verdict / report) and `state.recent_events`?",
+          "What should the orchestrator do on this turn, given `state.goal`, `state.workers` (name / agent / running / spawn_failed / completed / verdict / report), `state.pending_asks`, `state.blockers` and `state.recent_events`?",
         criteria: {
           spawn_worker:
             "A piece of the goal's work has no worker yet (never spawned, or a spawn failed and should be retried), or a worker finished and clearly more delegated work remains. Multiple workers may run in parallel or sequence.",
@@ -329,6 +585,10 @@ function buildRequest(req) {
             "All delegated work is finished (every spawned worker completed with done verdicts) or the goal conclusively cannot proceed; report the outcome upward now.",
           check_in:
             "A running worker may be stuck or off-course; a brief status check to it is warranted.",
+          think:
+            "A pending child ask or blocker needs reasoning beyond mechanical routing; dispatch the thinker once with the decision context.",
+          escalate:
+            "A pending child ask or a dead-end blocker exists that the orchestrator cannot resolve mechanically; surface it upward now (the parent routes it to the user or a thinker).",
           other: "None of these describe the current situation.",
         },
       },
@@ -339,7 +599,7 @@ function buildRequest(req) {
 }
 
 /** One converged result from every completed worker's report. */
-function convergeReport(workers, done, next) {
+export function convergeReport(workers, done, next) {
   const completed = workers.filter((w) => w.completed && w.report);
   if (completed.length === 0) {
     return `No worker reports were received (jev: done=${done.toFixed(2)}, next=${next}).`;
@@ -353,7 +613,26 @@ function convergeReport(workers, done, next) {
     .slice(0, 4000);
 }
 
-function mapAnswers(answers, req) {
+/** E1: the budgeted decision state as text — the same picture jev sees. */
+function decisionStateText(req, goal, workers) {
+  const carriers = goalForState(goal, req.agent?.sessionFile);
+  const rows = budgetWorkerRows(workers);
+  const workerLines = rows.map(
+    (r) =>
+      `- ${r.name} (${r.agent ?? "?"}, ${
+        r.completed
+          ? `completed, verdict ${r.verdict ?? "?"}`
+          : r.running
+            ? "running"
+            : r.spawn_failed
+              ? "spawn_failed"
+              : "spawned"
+      })${r.report ? `\n  report: ${r.report}` : ""}`,
+  );
+  return `Goal:\n${carriers.goal}\n\nWorkers:\n${workerLines.join("\n") || "(none)"}`;
+}
+
+export function mapAnswers(answers, req) {
   // The report was already delivered — never call subagent_done twice.
   if (doneAlreadyCalled(req.events)) {
     return { terminal: true, say: "Already reported done; ending.", calls: [] };
@@ -381,7 +660,81 @@ function mapAnswers(answers, req) {
       ? answers.worker_agent.choice
       : "worker";
   const goal = resolveGoal(req.events);
-  const workers = workersState(req.events);
+  const workers = mergedWorkers(req.agent?.sessionFile, req.events);
+  const asks = pendingAsks(req.events);
+  const blockers = workers.filter((w) => w.spawn_failed);
+  // Leaf sessions (PI_DENY_TOOLS) have no spawn tools; emitting them faults every repair attempt.
+  const canSpawn = req.tools.some((t) => t.name === "subagent");
+  const canAnswerChild = req.tools.some((t) => t.name === "subagent_answer_child");
+
+  // E2: route a completed thinker's report — answer the asking child, or
+  // escalate its finding upward (unparsable is an escalation, never a re-think).
+  const thinker = unconsumedThinker(workers, asks);
+  if (thinker) {
+    const parsed = parseThinkerReport(thinker.worker.report);
+    if (parsed?.kind === "response" && canAnswerChild) {
+      return {
+        say: `Answering ${thinker.ask.from} on ask ${thinker.ask.askId} with the thinker's response.`,
+        calls: [
+          {
+            tool: "subagent_answer_child",
+            args: { askId: thinker.ask.askId, answer: parsed.text },
+            reason: "thinker response routed to the asking child",
+          },
+        ],
+      };
+    }
+    if (escalationSent(req.events, thinker.ask.askId)) {
+      return { say: "Thinker escalation already sent; waiting for the user.", calls: [] };
+    }
+    const finding =
+      parsed?.kind === "escalation_request"
+        ? parsed.text
+        : `The thinker's report was unparsable and needs the user's judgement. Raw report (first 1500 chars):\n${String(thinker.worker.report).slice(0, 1500)}`;
+    return escalateAction(req, {
+      key: thinker.ask.askId,
+      title: `Pending child ask ${thinker.ask.askId} from "${thinker.ask.from}" needs the user`,
+      body: escalationBody([thinker.ask], blockers, `Thinker's finding:\n${finding}`),
+      markerAskId: thinker.ask.askId,
+    });
+  }
+
+  // B3: pending asks and dead-end blockers reach the user by capability.
+  if (next === "escalate" && (asks.length > 0 || blockers.length > 0)) {
+    const ask = asks[0];
+    // One escalation per ask: a re-chosen escalate idles until answered.
+    if (ask && escalationSent(req.events, ask.askId)) {
+      return { say: "Escalation already sent; waiting for the answer.", calls: [] };
+    }
+    return escalateAction(req, {
+      key: ask?.askId ?? "goal-blocker",
+      title: ask
+        ? `Pending child ask ${ask.askId} from "${ask.from}" needs the user`
+        : "Decision orchestrator blocked by spawn failures",
+      body: escalationBody(asks, blockers),
+      markerAskId: ask?.askId ?? null,
+    });
+  }
+
+  // A4: a zero-worker turn must never exit as done while spawning is possible —
+  // truncation can hide the real state, so verify mechanically instead.
+  if ((done >= 0.5 || next === "report_done") && workers.length === 0 && canSpawn) {
+    const name = `Worker ${workers.length + 1}`;
+    const task =
+      `You are ${name}: the decision engine believes the goal may already be achieved. ` +
+      `Verify the goal below is fully done; if anything remains, do it; report either way via subagent_done.\n\n` +
+      goal;
+    return {
+      say: `Zero workers with a done-leaning verdict; spawning ${name} (${agentType}) to verify.`,
+      calls: [
+        {
+          tool: "subagent",
+          args: { name, agent: agentType, task, cwd: req.agent?.cwd ?? process.cwd() },
+          reason: "zero-worker guard: verify before exiting as done",
+        },
+      ],
+    };
+  }
 
   if (done >= 0.5 || next === "report_done") {
     // Converge: the report the parent receives is every worker's report, not a stub.
@@ -397,6 +750,58 @@ function mapAnswers(answers, req) {
       ],
     };
   }
+  if (next === "spawn_worker" && !canSpawn) {
+    // A leaf session can only terminate cleanly with an explanatory report; holding would idle-loop.
+    return {
+      terminal: true,
+      say: "No spawn tool in this session's toolset; reporting upward.",
+      calls: [
+        {
+          tool: "subagent_done",
+          args: {
+            result:
+              "Decision engine cannot act on this goal: this session's toolset has no `subagent` spawn tool, so delegated execution is impossible here. Goal was NOT completed.\n\nGoal: " +
+              goal.slice(0, 400),
+          },
+          reason: "spawn_worker selected but subagent tool unavailable",
+        },
+      ],
+    };
+  }
+  // E1: a pending ask routes once through the thinker with the same budgeted
+  // decision state jev sees (E3: one dispatch per askId, ever).
+  if (next === "think" && asks.length > 0 && canSpawn) {
+    const ask = asks[0];
+    if (thinkerDispatched(req.events, ask.askId)) {
+      return { say: "Thinker already dispatched; waiting for its report.", calls: [] };
+    }
+    const name = `thinker-${ask.askId}`;
+    const task =
+      `thinker_for: ${ask.askId}\n\n` +
+      `A child of this orchestrator is blocked on a pending ask; reason about it beyond mechanical routing.\n\n` +
+      `Pending ask ${ask.askId} from "${ask.from}":\n${ask.text}\n\n` +
+      `Decision state (the same budgeted picture the orchestrator's engine sees):\n\n${decisionStateText(req, goal, workers)}\n\n` +
+      `Decide: answer the asking child yourself, or surface the matter to the user. Return exactly one fenced JSON block:\n` +
+      '```json\n{"kind": "response" | "escalation_request", "text": "...", "reasoning": "..."}\n```\n' +
+      `For kind "response", text is the answer delivered verbatim to the asking child. For kind "escalation_request", text is what the user must see.`;
+    return {
+      say: `Dispatching the thinker for ask ${ask.askId}.`,
+      calls: [
+        {
+          tool: "subagent",
+          args: {
+            name,
+            agent: "thinker",
+            thinking: "medium",
+            task,
+            cwd: req.agent?.cwd ?? process.cwd(),
+          },
+          reason: "pending ask routed to the thinker once",
+        },
+      ],
+    };
+  }
+
   if (next === "spawn_worker") {
     // The goal is orchestrator-facing; the worker needs its work, not the
     // orchestration meta-instructions (waiting, converging, watch-demo holds).
@@ -414,9 +819,11 @@ function mapAnswers(answers, req) {
 ${w.report.trim().slice(0, 1500)}`)
             .join("\n\n")
         : "";
+    // A2: the goal rides in full — the old 2000-char cut starved every child
+    // handoff whenever the actionable half sat past char 2000.
     const task =
       `You are ${name}: do the work below in one pass. Instructions about orchestrating, waiting, converging, or reporting upward are for your parent, not you — finish by calling subagent_done with your report.\n\n` +
-      goal.slice(0, 2000) +
+      goal +
       priorBlock.slice(0, 4000);
     return {
       say: `Spawning ${name} (${agentType}) for the goal.`,
@@ -429,7 +836,7 @@ ${w.report.trim().slice(0, 1500)}`)
       ],
     };
   }
-  if (next === "check_in") {
+  if (next === "check_in" && req.tools.some((t) => t.name === "subagent_ask_child")) {
     const running = workers.filter((w) => w.running && w.child_id);
     const chosen =
       running.find((w) => w.name === answers.check_in_target?.choice) ?? running[0];
@@ -490,9 +897,13 @@ async function decideOne(line, evaluateJev, resolveProxyToken) {
   }
 }
 
-try {
-  const { evaluateJev, resolveProxyToken } = await createJiti(import.meta.url).import(JEV_EXTENSION);
-  readStdinLines((line) => void decideOne(line, evaluateJev, resolveProxyToken));
-} catch (err) {
-  fail(err?.stack || String(err));
+// Boot is guarded so tests can import the pure functions without starting
+// the stdio loop (A0).
+if (process.env.JEV_BRIDGE_NO_BOOT !== "1") {
+  try {
+    const { evaluateJev, resolveProxyToken } = await createJiti(import.meta.url).import(JEV_EXTENSION);
+    readStdinLines((line) => void decideOne(line, evaluateJev, resolveProxyToken));
+  } catch (err) {
+    fail(err?.stack || String(err));
+  }
 }
