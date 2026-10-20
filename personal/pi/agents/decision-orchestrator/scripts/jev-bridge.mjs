@@ -28,7 +28,7 @@ import { createJiti } from "@mariozechner/jiti";
 const JEV_EXTENSION =
   "/Users/olivier/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/index.ts";
 // Bump when the extension must distinguish a pinned, older bridge process.
-export const BRIDGE_VERSION = 3;
+export const BRIDGE_VERSION = 4;
 if (process.argv.includes("--version")) {
   process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
   process.exit(0);
@@ -144,10 +144,12 @@ const subagentsPath = process.env.JEV_SUBAGENTS_PATH ?? join(
 let orchestrationJournal;
 let completionDecisions;
 let sessionMessages;
+let recovery;
 try {
   orchestrationJournal = await jiti.import(join(subagentsPath, "orchestration-journal.ts"));
   completionDecisions = await jiti.import(join(subagentsPath, "completion-decisions.ts"));
   sessionMessages = await jiti.import(join(subagentsPath, "session-messages.ts"));
+  recovery = await jiti.import(join(subagentsPath, "recovery.ts"));
 } catch (err) {
   fail(`Cannot load shared orchestration modules from JEV_SUBAGENTS_PATH=${subagentsPath}. ` +
     `Update the installed subagents extension and reload sessions before activating this bridge, ` +
@@ -326,14 +328,11 @@ export function foldEvents(receipts, events, capabilities) {
       const rows = Object.values(receipts.lifecycle);
       const byId = args.id ?? args.subagentId ?? (e.tool !== "subagent_resume" ? details.id ?? details.childId : undefined);
       const candidates = e.tool === "subagent_resume" && args.sessionPath
-        ? rows.filter((r) => r.sessionFile === args.sessionPath && !r.resumedBy)
+        ? rows.filter((r) => r.sessionFile && recovery.canonicalSessionPath(r.sessionFile) === recovery.canonicalSessionPath(args.sessionPath) && !r.resumedBy)
         : byId ? rows.filter((r) => r.childId === byId)
           : rows.filter((r) => r.name === args.name);
-      // A resume with only a session path falls back to the single
-      // exited-without-done row — the only resume-eligible state.
-      const resolved = candidates.length === 1 ? candidates : candidates.length === 0 && e.tool === "subagent_resume"
-        ? rows.filter((r) => r.state === "exited-without-done" && !r.resumedBy)
-        : candidates;
+      // Never guess an unrelated transcript when canonical-path lookup fails.
+      const resolved = candidates;
       const row = resolved.length === 1 ? resolved[0] : undefined;
       if (!row) {
         operation.acknowledgement.infraIssue = true;
@@ -343,7 +342,7 @@ export function foldEvents(receipts, events, capabilities) {
       operation.acknowledgement.childId = row.childId;
       if (e.tool === "subagent_resume") {
         const newChildId = details.id ?? /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1];
-        if (row.state !== "exited-without-done" || typeof newChildId !== "string" || !newChildId || newChildId === row.childId) {
+        if (!(row.state === "exited-without-done" || (row.state === "killed" && recovery.mayResume(row.recoveryCause))) || typeof newChildId !== "string" || !newChildId || newChildId === row.childId) {
           operation.acknowledgement.infraIssue = true;
           operation.acknowledgement.error = "resume acknowledgement lacks an eligible old row or a new child id";
           continue;
@@ -902,7 +901,7 @@ export function buildRequest(req) {
       ...(ledger.unresolved.length ? { unresolved_operations: ledger.unresolved } : {}),
     },
     questions: {
-      ...(completion ? {completion_decision: {type: 'choice', instructions: 'Choose exactly one offered completion option. Approval authorizes only its admitted sequential actions; human approval is a separate ask action.',
+      ...(completion ? {completion_decision: {type: 'choice', instructions: 'Choose exactly one offered completion or engine-recovery option. Recovery eligibility, mandatory teardown, thinker interrupt approval and resume caps are engine guards, not classifier judgement. Approval authorizes only the admitted sequential actions; human approval is a separate ask action.',
         criteria: Object.fromEntries(completion.offer.decisions.map((option) => [option.id, option.description]))}} : {}),
       done: {
         type: "noul",
