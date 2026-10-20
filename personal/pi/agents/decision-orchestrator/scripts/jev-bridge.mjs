@@ -18,6 +18,7 @@
 // completion compatibility.
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -28,6 +29,10 @@ const JEV_EXTENSION =
   "/Users/olivier/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/index.ts";
 // Bump when the extension must distinguish a pinned, older bridge process.
 export const BRIDGE_VERSION = 2;
+if (process.argv.includes("--version")) {
+  process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
+  process.exit(0);
+}
 const MODEL = process.env.JEV_MODEL || "jev-latest";
 const OUTPUT_LIMIT = 400;
 // Parent-authored text (goals, mid-run parent messages) rides at 2000 so the
@@ -136,9 +141,19 @@ const jiti = createJiti(import.meta.url);
 const subagentsPath = process.env.JEV_SUBAGENTS_PATH ?? join(
   homedir(), ".pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents",
 );
+let orchestrationJournal;
+let sessionMessages;
+try {
+  orchestrationJournal = await jiti.import(join(subagentsPath, "orchestration-journal.ts"));
+  sessionMessages = await jiti.import(join(subagentsPath, "session-messages.ts"));
+} catch (err) {
+  fail(`Cannot load shared orchestration modules from JEV_SUBAGENTS_PATH=${subagentsPath}. ` +
+    `Update the installed subagents extension and reload sessions before activating this bridge, ` +
+    `or set JEV_SUBAGENTS_PATH to a compatible checkout. ${err?.message ?? err}`);
+}
 const { canTransition, emptyReceipts, applyLifecycle, loadOrchReceipts, mergeReceipts,
-  saveOrchReceipts: saveSharedReceipts } = await jiti.import(join(subagentsPath, "orchestration-journal.ts"));
-const { normalizeAcknowledgement } = await jiti.import(join(subagentsPath, "session-messages.ts"));
+  saveOrchReceipts: saveSharedReceipts } = orchestrationJournal;
+const { normalizeAcknowledgement } = sessionMessages;
 export { canTransition, emptyReceipts };
 
 const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -220,7 +235,7 @@ export function foldEvents(receipts, events, capabilities) {
           }
         }
         if (["subagent_kill", "subagent_interrupt", "subagent_resume"].includes(c?.tool)) {
-          const operationId = c.args?.operationId ?? `control:${c.id}`;
+          const operationId = `control:${c.id}`;
           const operation = receipts.operations[operationId] ??= {};
           if (!operation.intent) {
             operation.intent = { phase: "intent", tool: c.tool, callId: c.id, childId: c.args?.id ?? c.args?.subagentId, detail: { args: c.args } };
@@ -274,8 +289,7 @@ export function foldEvents(receipts, events, capabilities) {
       }
     } else if (e.type === "tool_result" && ["subagent_kill", "subagent_interrupt", "subagent_resume"].includes(e.tool)) {
       const call = calls.get(e.callId);
-      const operationId = call?.args?.operationId ?? Object.entries(receipts.operations)
-        .find(([, row]) => row.intent?.callId === e.callId && row.intent.tool === e.tool)?.[0] ?? `control:${e.callId}`;
+      const operationId = `control:${e.callId}`;
       const operation = receipts.operations[operationId] ??= {};
       const args = call?.args ?? operation.intent?.detail?.args ?? {};
       const details = isRecord(e.details) ? e.details : {};
@@ -363,7 +377,9 @@ export function foldEvents(receipts, events, capabilities) {
           : [];
       const target = Array.isArray(row) ? (row.length === 1 ? row[0] : undefined) : row;
       if (!target) continue;
-      const completionId = `${target.childId}:${payload.resultStorePath ?? e.message?.eventId ?? e.eventId}`;
+      const completionIdentity = payload.resultStorePath ?? e.message?.eventId ?? e.eventId;
+      if (!completionIdentity) continue;
+      const completionId = `${target.childId}:${completionIdentity}`;
       if (receipts.consumedCompletions.includes(completionId)) continue;
       receipts.consumedCompletions.push(completionId);
       // Explicit completionKind from the parent's watcher/.exit facts. Legacy
@@ -409,7 +425,7 @@ export function foldEvents(receipts, events, capabilities) {
 export function mergedWorkers(sessionFile, events, capabilities) {
   const loaded = readOrchReceipts(sessionFile);
   const receipts = loaded.receipts;
-  const ledger = { corrupt: loaded.corrupt === true, error: loaded.error, writeError: null, operationError: null, unresolved: [] };
+  const ledger = { corrupt: loaded.corrupt === true, error: loaded.error, writeError: null, operationError: null, operationErrorIds: [], unresolved: [] };
   if (loaded.corrupt) return { rows: workerRows(receipts), ledger, receipts };
   if (Object.keys(receipts.lifecycle).length === 0) {
     try {
@@ -421,7 +437,7 @@ export function mergedWorkers(sessionFile, events, capabilities) {
   }
   foldEvents(receipts, events, capabilities);
   const operations = Object.entries(receipts.operations);
-  const unresolved = operations.find(([, operation], index) => {
+  const unresolved = operations.filter(([, operation], index) => {
     const ack = operation.acknowledgement?.infraIssue ? operation.acknowledgement : operation.intent;
     if (!ack?.infraIssue) return false;
     const childId = ack.childId ?? operation.intent?.childId;
@@ -434,7 +450,11 @@ export function mergedWorkers(sessionFile, events, capabilities) {
         ((effect.ts ?? 0) > (ack.ts ?? 0) || ((effect.ts ?? 0) === (ack.ts ?? 0) && laterIndex > index));
     });
   });
-  if (unresolved) ledger.operationError = `${unresolved[0]}: ${unresolved[1].acknowledgement?.error ?? unresolved[1].intent?.error}`;
+  if (unresolved.length) {
+    ledger.operationErrorIds = unresolved.map(([id]) => id).sort();
+    ledger.operationError = unresolved.map(([id, operation]) =>
+      `${id}: ${operation.acknowledgement?.error ?? operation.intent?.error}`).join("; ");
+  }
   ledger.unresolved = operations.filter(([, operation]) => operation.intent && !operation.acknowledgement && !operation.effect)
     .map(([id]) => id);
   ledger.unresolved.push(...Object.values(receipts.lifecycle)
@@ -680,7 +700,7 @@ function escalateAction(req, { key, title, body, markerAskId, forwardAskId = nul
           result:
             `ESCALATION REQUEST${marker ? ` (${marker})` : ""}: ${title}\n\n` +
             `Goal was NOT completed — this is an escalation request needing the user, not a completion report.\n\n` +
-            (key === "ledger-corrupt" ? `While the orchestration ledger is corrupt or unwritable, this subagent_done call will be REFUSED by the extension ` +
+            (key.startsWith("ledger-corrupt:") ? `While the orchestration ledger is corrupt or unwritable, this subagent_done call will be REFUSED by the extension ` +
               `(fail closed); no completion can be recorded.\n\n` : "") + body,
         },
         reason: "no escalate/ask_parent capability; terminal escalation report",
@@ -971,16 +991,18 @@ export function mapAnswers(answers, req) {
   // Corrupt or unwritable ledger: convergence may never succeed on an
   // unfaithful picture — stop and infra-escalate instead.
   if (ledger.corrupt || ledger.writeError || ledger.operationError) {
-    const key = ledger.corrupt || ledger.writeError ? "ledger-corrupt"
-      : ledger.operationError.startsWith("protocol:") ? "protocol-completion-kind" : "ledger-operation";
-    if (escalationSent(req.events, key, receipts)) {
-      return { say: "Ledger escalation already sent; waiting for reconciliation.", calls: [] };
-    }
     const problem = ledger.corrupt
       ? `orchestration ledger corrupt: ${ledger.error}`
       : ledger.writeError
         ? `orchestration ledger write failed: ${ledger.writeError}`
         : `orchestration control unresolved: ${ledger.operationError}`;
+    const key = ledger.corrupt || ledger.writeError
+      ? `ledger-corrupt:${createHash("sha256").update(problem).digest("hex").slice(0, 16)}`
+      : `${ledger.operationErrorIds.every((id) => id.startsWith("protocol:"))
+        ? "protocol-completion-kind" : "ledger-operation"}:${ledger.operationErrorIds.join(",")}`;
+    if (escalationSent(req.events, key, receipts)) {
+      return { say: "Ledger escalation already sent; waiting for reconciliation.", calls: [] };
+    }
     return escalateAction(req, {
       key,
       title: "Decision orchestrator cannot trust its worker ledger",
@@ -1083,7 +1105,15 @@ export function mapAnswers(answers, req) {
   }
 
   if ((done >= 0.5 || next === "report_done") && ledger.unresolved.length) {
-    return { say: `Holding: unresolved operations ${ledger.unresolved.join(", ")} need reconciliation.`, calls: [] };
+    const unresolved = [...new Set(ledger.unresolved)].sort();
+    const key = `unresolved-operations:${unresolved.join(",")}`;
+    if (escalationSent(req.events, key, receipts)) {
+      return { say: `Holding: unresolved operations ${unresolved.join(", ")} need reconciliation.`, calls: [] };
+    }
+    return escalateAction(req, {
+      key, title: "Orchestration operations need reconciliation",
+      body: `Goal completion is blocked by unresolved operations: ${unresolved.join(", ")}. Reconcile their outcomes before proceeding.`,
+    });
   }
 
   // A4: a zero-worker turn must never exit as done while spawning is possible —
@@ -1116,17 +1146,17 @@ export function mapAnswers(answers, req) {
         calls: [],
       };
     }
-    const incomplete = workers.filter((w) => ["exited-without-done", "failed"].includes(w.state) &&
-      !completedResume(workers, w));
+    const incomplete = workers.filter((w) => w.purpose !== "think" &&
+      ["exited-without-done", "failed"].includes(w.state) && !completedResume(workers, w));
     if (incomplete.length || !workers.some((w) => w.completed && w.report)) {
-      const key = "workers-incomplete";
+      const key = `workers-incomplete:${incomplete.map((w) => w.child_id).sort().join(",") || "no-reports"}`;
       if (escalationSent(req.events, key, receipts)) {
         return { say: "Incomplete-worker escalation already sent; waiting for reconciliation.", calls: [] };
       }
       return escalateAction(req, {
         key, title: "Worker outcomes do not establish goal completion",
         body: incomplete.length
-          ? `Goal was NOT completed. Reconcile or recover these workers: ${incomplete.map((w) => `${w.child_id} (${w.state})`).join(", ")}. Any authorized resume is capped at three attempts per session chain.`
+          ? `Goal was NOT completed. Reconcile or recover these workers: ${incomplete.map((w) => `${w.child_id} (${w.state})`).join(", ")}.`
           : "Goal was NOT completed: no completed worker reports were received.",
       });
     }
@@ -1262,9 +1292,7 @@ async function decideOne(line, evaluateJev, resolveProxyToken) {
 
 // Boot is guarded so tests can import the pure functions without starting
 // the stdio loop (A0).
-if (process.argv.includes("--version")) {
-  process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
-} else if (process.env.JEV_BRIDGE_NO_BOOT !== "1") {
+if (process.env.JEV_BRIDGE_NO_BOOT !== "1") {
   try {
     const { evaluateJev, resolveProxyToken } = await jiti.import(JEV_EXTENSION);
     readStdinLines((line) => void decideOne(line, evaluateJev, resolveProxyToken));
