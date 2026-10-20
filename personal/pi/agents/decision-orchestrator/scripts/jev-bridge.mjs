@@ -19,7 +19,7 @@
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createJiti } from "@mariozechner/jiti";
 
 const JEV_EXTENSION =
@@ -115,104 +115,365 @@ function callArgsById(events) {
 }
 
 /**
- * Every worker this orchestrator has spawned, with per-worker completion from
- * the subagent_result notices (matched by the spawned name). A spawn only
- * counts as running when its tool call succeeded; a failed spawn stays
- * visible as spawn_failed so the engine can choose to retry.
+ * Every worker this orchestrator has spawned, keyed by STABLE CHILD ID —
+ * display names are presentation only (same-name children are distinct rows).
+ * Identity = stable child id + canonical session chain + attempt; rows carry
+ * the assigned task ids and the arm purpose (work/think/...), never special
+ * agent names.
+ *
+ * Lifecycle states: spawn_pending/running/completed/failed/killed/interrupted/
+ * resumed/exited-without-done. An emitted call is not an executed call: intent
+ * (decision call), acknowledgement (tool_result) and effect (transition) are
+ * journal phases, folded through a guarded state machine so an old spawn
+ * replay can never overwrite a newer durable kill/interruption. Kill emits no
+ * subagent_result — a killed row comes only from the kill tool acknowledgement.
  */
-function workersState(events) {
-  const calls = callArgsById(events);
-  const workers = new Map();
-  for (const e of events) {
-    if (e.type !== "tool_result" || e.tool !== "subagent") continue;
-    const call = calls.get(e.callId);
-    const name = String(call?.args?.name ?? "Goal worker");
-    if (e.isError) {
-      const w = workers.get(name);
-      if (w) {
-        w.running = false;
-        w.spawn_failed = true;
-      } else {
-        workers.set(name, {
-          name,
-          agent: call?.args?.agent ?? null,
-          child_id: null,
-          running: false,
-          spawn_failed: true,
-          completed: false,
-          verdict: null,
-          report: null,
-          report_path: null,
-        });
-      }
-      continue;
-    }
-    const childId = /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1] ?? null;
-    workers.set(name, {
-      name,
-      agent: call?.args?.agent ?? null,
-      child_id: childId,
-      running: childId !== null,
-      spawn_failed: false,
-      completed: false,
-      verdict: null,
-      report: null,
-      report_path: null,
-    });
-  }
-  for (const e of events) {
-    if (e.type !== "notification" || e.kind !== "subagent_result") continue;
-    const w = workers.get(String(e.payload?.name ?? ""));
-    if (!w) continue;
-    w.running = false;
-    w.completed = true;
-    const text = String(e.text ?? "");
-    // Workers that finish naturally (no subagent_done call) still report
-    // "completed"; without an explicit verdict treat that as done, or
-    // convergence would depend on the child remembering to use the tool.
-    w.verdict = /verdict:\s*(\w+)/.exec(text)?.[1] ?? (/completed/i.test(text) ? "done" : null);
-    const stored = e.payload?.resultStorePath ?? /Stored path:\s*(\S+)/.exec(text)?.[1];
-    let report = text;
-    if (stored) {
-      try {
-        report = readFileSync(stored, "utf8");
-      } catch {
-        // store unreadable — the notice text still carries the essentials
-      }
-    }
-    w.report = report.slice(0, 4000);
-    w.report_path = stored ?? null;
-  }
-  return [...workers.values()];
+const LIFECYCLE_STATES = [
+  "spawn_pending", "running", "completed", "failed",
+  "killed", "interrupted", "resumed", "exited-without-done",
+];
+
+const TRANSITIONS = {
+  spawn_pending: ["running", "killed", "exited-without-done", "interrupted", "completed", "failed"],
+  running: ["completed", "failed", "interrupted", "killed", "exited-without-done"],
+  interrupted: ["completed", "failed", "killed", "exited-without-done"],
+  killed: [],
+  completed: [],
+  failed: [],
+  // Resume eligibility: only a child that exited without reporting done may
+  // be resumed (P6 ruling); completed/failed/killed work is never resumed.
+  "exited-without-done": ["completed", "failed", "resumed"],
+  resumed: ["completed", "failed", "interrupted", "killed", "exited-without-done"],
+};
+
+export function canTransition(from, to) {
+  return from === to || TRANSITIONS[from].includes(to);
 }
 
-/** D2: `<session>.workers.json` persists worker rows past the 200-message
- *  transcript window (same sidecar pattern as `.args.json`/`.ledger.json`).
- *  Every build pass merges event-derived rows onto the ledger (events win) and
- *  persists the merge; failure falls back to event-derived rows only. */
+export function emptyReceipts() {
+  return {
+    v: 1,
+    lifecycle: {},
+    operations: {},
+    consumedCompletions: [],
+    resumeReservations: {},
+    foldedEventCount: 0,
+  };
+}
+
+function applyLifecycle(receipts, childId, state, ts, fields = {}) {
+  const previous = receipts.lifecycle[childId];
+  if (previous && !canTransition(previous.state, state)) return false;
+  // Merge over the previous row: identity (name/agent/taskIds/purpose) and
+  // attempt survive every transition.
+  receipts.lifecycle[childId] = {
+    ...(previous ?? {}),
+    ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)),
+    childId,
+    state,
+    stateTs: ts,
+    attempt: fields.attempt ?? previous?.attempt,
+    purpose: fields.purpose ?? previous?.purpose,
+  };
+  return true;
+}
+
+function mergeReceipts(target, raw) {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "unrecognized .orch.json shape" };
+  if (raw.v !== 1) return { ok: false, error: `unknown .orch.json version ${raw.v}` };
+  if (raw.lifecycle != null && (typeof raw.lifecycle !== "object" || Array.isArray(raw.lifecycle))) {
+    return { ok: false, error: "malformed .orch.json lifecycle" };
+  }
+  for (const [childId, row] of Object.entries(raw.lifecycle ?? {})) {
+    if (!row || typeof row !== "object" || !LIFECYCLE_STATES.includes(row.state)) {
+      return { ok: false, error: "malformed .orch.json lifecycle row" };
+    }
+    const existing = target.lifecycle[childId];
+    // A durable terminal state stands: an older spawn row never overwrites it.
+    if (!existing || row.stateTs >= existing.stateTs) target.lifecycle[childId] = row;
+  }
+  for (const [id, operation] of Object.entries(raw.operations ?? {})) {
+    target.operations[id] = { ...operation, ...target.operations[id] };
+  }
+  for (const id of raw.consumedCompletions ?? []) {
+    if (!target.consumedCompletions.includes(id)) target.consumedCompletions.push(id);
+  }
+  Object.assign(target.resumeReservations, raw.resumeReservations ?? {});
+  target.foldedEventCount = Math.max(target.foldedEventCount, raw.foldedEventCount ?? 0);
+  return { ok: true };
+}
+
+/** Load `<session>.orch.json`; corrupt or unrecognized state is returned as
+ *  corrupt so the engine escalates instead of proceeding on an empty ledger. */
+export function readOrchReceipts(sessionFile) {
+  const receipts = emptyReceipts();
+  if (!sessionFile) return { receipts, corrupt: false };
+  let raw;
+  try {
+    raw = readFileSync(`${sessionFile}.orch.json`, "utf8");
+  } catch {
+    return { receipts, corrupt: false };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return { receipts, corrupt: true, error: `.orch.json is not parsable: ${error.message}` };
+  }
+  const merged = mergeReceipts(receipts, parsed);
+  return merged.ok ? { receipts, corrupt: false } : { receipts, corrupt: true, error: merged.error };
+}
+
+/** Atomic receipt write: temp + rename, never a partial ledger. */
+export function saveOrchReceipts(sessionFile, receipts) {
+  if (!sessionFile) return { ok: true };
+  const target = `${sessionFile}.orch.json`;
+  const temp = `${target}.tmp`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(receipts, null, 2)}\n`);
+    renameSync(temp, target);
+    return { ok: true };
+  } catch (error) {
+    try {
+      unlinkSync(temp);
+    } catch {}
+    return { error: `receipt write failed: ${error?.message ?? error}` };
+  }
+}
+
+/** Legacy `<session>.workers.json` rows fold in as attempt-1 spawn rows; new
+ *  writes go to `.orch.json` only. Unreadable legacy rows are skipped. */
+export function migrateLegacyWorkers(receipts, legacyRows) {
+  if (!Array.isArray(legacyRows)) return;
+  for (const row of legacyRows) {
+    if (!row || typeof row !== "object" || typeof row.name !== "string") continue;
+    const childId = typeof row.child_id === "string" && row.child_id ? row.child_id : `legacy:${row.name}`;
+    if (receipts.lifecycle[childId]) continue;
+    const state = row.completed ? "completed" : row.spawn_failed ? "spawn_pending" : row.child_id ? "running" : "spawn_pending";
+    receipts.lifecycle[childId] = {
+      childId,
+      name: row.name,
+      ...(row.agent ? { agent: row.agent } : {}),
+      purpose: "work",
+      attempt: 1,
+      state,
+      stateTs: 0,
+      ...(row.report_path ? { resultStorePath: row.report_path } : {}),
+      ...(row.spawn_failed ? { spawnFailed: true } : {}),
+    };
+  }
+}
+
+/** Purpose from the spawn the bridge itself emitted: our own decision calls
+ *  carry the mapping, so no agent-name heuristics are needed downstream. */
+function purposeOfCall(call) {
+  if (call?.tool !== "subagent") return undefined;
+  const task = String(call.args?.task ?? "");
+  const thinkerFor = /thinker_for: (\S+)/.exec(task);
+  return thinkerFor ? "think" : "work";
+}
+
+/**
+ * Fold transcript events onto the receipts. Events only ADD: each index folds
+ * once (`foldedEventCount` guards replay after reload), and lifecycle moves
+ * through the guarded state machine — a replayed spawn ack cannot regress a
+ * durable kill/interruption, and a completion after a kill is a phantom.
+ */
+export function foldEvents(receipts, events) {
+  let changed = false;
+  const start = receipts.foldedEventCount;
+  const calls = callArgsById(events);
+  for (let i = start; i < events.length; i++) {
+    const e = events[i];
+    if (e.type === "decision" && Array.isArray(e.calls)) {
+      for (const c of e.calls) {
+        if (c?.tool !== "subagent") continue;
+        const operationId = `spawn:${c.id}`;
+        if (receipts.operations[operationId]?.intent) continue;
+        const key = `call:${c.id}`;
+        receipts.operations[operationId] = {
+          intent: { tool: "subagent", phase: "intent", childKey: key },
+        };
+        applyLifecycle(receipts, key, "spawn_pending", Date.now(), {
+          name: String(c.args?.name ?? "Goal worker"),
+          agent: c.args?.agent ?? null,
+          purpose: purposeOfCall(c),
+          attempt: 1,
+          taskIds: Array.isArray(c.args?.tasks) ? c.args.tasks : undefined,
+          askId: /thinker_for: (\S+)/.exec(String(c.args?.task ?? ""))?.[1],
+        });
+        changed = true;
+      }
+    } else if (e.type === "tool_result" && e.tool === "subagent") {
+      const operationId = `spawn:${e.callId}`;
+      const intent = receipts.operations[operationId]?.intent;
+      if (!intent || receipts.operations[operationId].acknowledgement) continue;
+      receipts.operations[operationId].acknowledgement = { phase: "acknowledgement", isError: Boolean(e.isError) };
+      const key = intent.childKey;
+      const row = receipts.lifecycle[key];
+      if (e.isError) {
+        if (row) {
+          row.spawnFailed = true;
+          changed = true;
+        }
+        continue;
+      }
+      const childId = /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1];
+      if (childId && row) {
+        delete receipts.lifecycle[key];
+        receipts.lifecycle[childId] = { ...row, childId };
+        applyLifecycle(receipts, childId, "running", Date.now(), {});
+        receipts.operations[operationId].acknowledgement.childId = childId;
+        changed = true;
+      }
+    } else if (e.type === "tool_result" && ["subagent_kill", "subagent_interrupt", "subagent_resume"].includes(e.tool)) {
+      const state = e.tool === "subagent_kill" ? "killed" : e.tool === "subagent_interrupt" ? "interrupted" : "resumed";
+      // The control call's args (intent, matched by callId) name the target.
+      const args = calls.get(e.callId)?.args ?? {};
+      const rows = Object.values(receipts.lifecycle);
+      const byId = args.id ?? args.subagentId;
+      const candidates = byId
+        ? rows.filter((r) => r.childId === byId)
+        : e.tool === "subagent_resume" && args.sessionPath
+          ? rows.filter((r) => r.sessionFile === args.sessionPath)
+          : rows.filter((r) => r.name === args.name);
+      // A resume with only a session path falls back to the single
+      // exited-without-done row — the only resume-eligible state.
+      const resolved = candidates.length === 1 ? candidates : candidates.length === 0 && e.tool === "subagent_resume"
+        ? rows.filter((r) => r.state === "exited-without-done")
+        : candidates;
+      const row = resolved.length === 1 ? resolved[0] : undefined;
+      // Only an acknowledged control action moves the ledger; a failed
+      // interrupt/kill leaves the child in its current state.
+      if (!row || e.isError) continue;
+      if (e.tool === "subagent_resume") {
+        // The resumed attempt is a NEW child on the old session chain: the
+        // old row records the resume, the new row carries attempt+1 and the
+        // preserved purpose.
+        applyLifecycle(receipts, row.childId, "resumed", Date.now(), {});
+        const newChildId = /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1];
+        if (newChildId && newChildId !== row.childId) {
+          receipts.lifecycle[newChildId] = {
+            ...row,
+            childId: newChildId,
+            attempt: (row.attempt ?? 1) + 1,
+            resumedFrom: args.sessionPath ?? row.sessionFile ?? null,
+            state: "resumed",
+            stateTs: Date.now(),
+          };
+        }
+        changed = true;
+        continue;
+      }
+      if (!applyLifecycle(receipts, row.childId, state, Date.now())) continue;
+      changed = true;
+    } else if (e.type === "notification" && e.kind === "subagent_result") {
+      const payload = e.payload ?? {};
+      const rows = Object.values(receipts.lifecycle);
+      const childId = String(payload.id ?? payload.childId ?? "");
+      const row = childId
+        ? rows.find((r) => r.childId === childId)
+        : payload.name
+          ? rows.filter((r) => r.name === payload.name)
+          : [];
+      const target = Array.isArray(row) ? (row.length === 1 ? row[0] : undefined) : row;
+      if (!target) continue;
+      const completionId = `${target.childId}:${payload.resultStorePath ?? e.ts ?? i}`;
+      if (receipts.consumedCompletions.includes(completionId)) continue;
+      receipts.consumedCompletions.push(completionId);
+      // Explicit completionKind from the parent's watcher/.exit facts. Legacy
+      // notices without one are never task success: an unknown clean exit
+      // folds as exited-without-done, never "completed".
+      const kind = payload.completionKind
+        ?? (payload.interrupted ? "interrupted"
+          : payload.lost ? "exited-without-done"
+            : (payload.exitCode ?? 0) !== 0 || payload.errorMessage ? "failed" : "exited-without-done");
+      applyLifecycle(receipts, target.childId, kind, Date.now(), {
+        completionKind: kind,
+        ...(payload.resultStorePath ? { resultStorePath: payload.resultStorePath } : {}),
+      });
+      // The store holds the full report; the notice text is the fallback.
+      let report = String(e.text ?? "");
+      if (payload.resultStorePath) {
+        try {
+          report = readFileSync(String(payload.resultStorePath), "utf8");
+        } catch {
+          // Store unreadable — the notice text still carries the essentials.
+        }
+      }
+      receipts.lifecycle[target.childId].report = report.slice(0, 4000);
+      changed = true;
+    }
+  }
+  if (events.length > receipts.foldedEventCount) {
+    receipts.foldedEventCount = events.length;
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * Merge the durable receipts (folded from the full transcript on every build
+ * pass) with the event fold and persist the merge. Corrupt or unwritable
+ * ledgers surface as flags — the engine must escalate, never converge on an
+ * empty ledger.
+ */
 export function mergedWorkers(sessionFile, events) {
-  const derived = workersState(events);
-  const merged = new Map();
-  if (sessionFile) {
+  const loaded = readOrchReceipts(sessionFile);
+  const receipts = loaded.receipts;
+  if (!loaded.corrupt && !receipts.foldedEventCount) {
     try {
       const rows = JSON.parse(readFileSync(`${sessionFile}.workers.json`, "utf8"));
-      if (Array.isArray(rows)) {
-        for (const w of rows) if (w && typeof w.name === "string") merged.set(w.name, w);
-      }
+      migrateLegacyWorkers(receipts, rows);
     } catch {
-      // unreadable ledger — event-derived rows still drive this turn
+      // No legacy ledger — a fresh one starts here.
     }
   }
-  for (const w of derived) merged.set(w.name, { ...merged.get(w.name), ...w });
-  const rows = [...merged.values()];
+  foldEvents(receipts, events);
+  const ledger = { corrupt: loaded.corrupt === true, error: loaded.error, writeError: null };
+  if (loaded.corrupt) {
+    return { rows: workerRows(receipts), ledger };
+  }
   if (sessionFile) {
-    try {
-      writeFileSync(`${sessionFile}.workers.json`, `${JSON.stringify(rows, null, 2)}\n`, "utf8");
-    } catch {
-      // best-effort persist — the merge still serves this decision
-    }
+    const saved = saveOrchReceipts(sessionFile, receipts);
+    if (saved.error) ledger.writeError = saved.error;
   }
-  return rows;
+  return { rows: workerRows(receipts), ledger };
+}
+
+/** The worker view over a lifecycle row: booleans the engine reasons with,
+ *  plus the stable identity, state and purpose. */
+function workerRows(receipts) {
+  return Object.values(receipts.lifecycle).map((row) => {
+    let report = row.report ?? null;
+    if (!report && row.resultStorePath) {
+      try {
+        report = readFileSync(String(row.resultStorePath), "utf8").slice(0, 4000);
+      } catch {
+        // Store unreadable — the pointer still stands.
+      }
+    }
+    return ({
+    child_id: row.childId.startsWith("call:") ? null : row.childId,
+    name: row.name,
+    agent: row.agent ?? null,
+    purpose: row.purpose ?? null,
+    attempt: row.attempt ?? 1,
+    session_file: row.sessionFile ?? null,
+    state: row.state,
+    running: ["running", "interrupted", "resumed"].includes(row.state),
+    spawn_failed: row.spawnFailed === true,
+    completed: row.state === "completed",
+    askId: row.askId ?? null,
+    task_ids: row.taskIds ?? [],
+    resume_eligible: row.resumeEligible === true,
+    resumed_from: row.resumedFrom ?? null,
+    completion_kind: row.completionKind ?? null,
+    verdict: row.state === "completed" ? "done" : null,
+    report,
+    report_path: row.resultStorePath ?? null,
+  });
+  });
 }
 
 /** D1: outstanding-work lines never budgeted away, whatever the slice. */
@@ -238,6 +499,13 @@ export function budgetWorkerRows(workers) {
       name: w.name,
       agent: w.agent,
       child_id: w.child_id,
+      purpose: w.purpose,
+      attempt: w.attempt,
+      state: w.state,
+      task_ids: w.task_ids,
+      resume_eligible: w.resume_eligible,
+      resumed_from: w.resumed_from,
+      completion_kind: w.completion_kind,
       running: w.running,
       spawn_failed: w.spawn_failed,
       completed: w.completed,
@@ -342,10 +610,8 @@ export function parseThinkerReport(report) {
 /** E2: the first completed thinker worker whose target ask is still pending. */
 function unconsumedThinker(workers, asks) {
   for (const w of workers) {
-    if (w.agent !== "thinker" || !w.completed || !w.report) continue;
-    if (!w.name.startsWith("thinker-")) continue;
-    const askId = w.name.slice("thinker-".length);
-    const ask = asks.find((a) => a.askId === askId);
+    if (w.purpose !== "think" || !w.completed || !w.report || !w.askId) continue;
+    const ask = asks.find((a) => a.askId === w.askId);
     if (ask) return { worker: w, ask };
   }
   return null;
@@ -550,7 +816,7 @@ export function goalForState(goal, sessionFile) {
 
 export function buildRequest(req) {
   const goal = resolveGoal(req.events);
-  const workers = mergedWorkers(req.agent?.sessionFile, req.events);
+  const { rows: workers, ledger } = mergedWorkers(req.agent?.sessionFile, req.events);
   const asks = pendingAsks(req.events);
   const carriers = goalForState(goal, req.agent?.sessionFile);
   const doneCalled = doneAlreadyCalled(req.events);
@@ -574,6 +840,10 @@ export function buildRequest(req) {
       done_already_reported: doneCalled,
       recent_events: digestEvents(req.events),
       run_state: req.state ?? null,
+      // A corrupt or unwritable ledger blocks convergence (never a silent
+      // empty-ledger fallback): mapAnswers refuses done and escalates.
+      ...(ledger.corrupt ? { ledger_corrupt: true, ledger_error: ledger.error } : {}),
+      ...(!ledger.corrupt && ledger.writeError ? { ledger_write_error: ledger.writeError } : {}),
     },
     questions: {
       done: {
@@ -669,12 +939,27 @@ export function mapAnswers(answers, req) {
       ? answers.worker_agent.choice
       : "worker";
   const goal = resolveGoal(req.events);
-  const workers = mergedWorkers(req.agent?.sessionFile, req.events);
+  const { rows: workers, ledger } = mergedWorkers(req.agent?.sessionFile, req.events);
   const asks = pendingAsks(req.events);
   const blockers = workers.filter((w) => w.spawn_failed);
   // Leaf sessions (PI_DENY_TOOLS) have no spawn tools; emitting them faults every repair attempt.
   const canSpawn = req.tools.some((t) => t.name === "subagent");
   const canAnswerChild = req.tools.some((t) => t.name === "subagent_answer_child");
+
+  // Corrupt or unwritable ledger: convergence may never succeed on an
+  // unfaithful picture — stop and infra-escalate instead.
+  if (ledger.corrupt || ledger.writeError) {
+    const problem = ledger.corrupt
+      ? `orchestration ledger corrupt: ${ledger.error}`
+      : `orchestration ledger write failed: ${ledger.writeError}`;
+    return escalateAction(req, {
+      key: "ledger-corrupt",
+      title: "Decision orchestrator cannot trust its worker ledger",
+      body:
+        `${problem}. The run was NOT completed — worker lifecycle state cannot be proven, ` +
+        `so no convergence or task completion may be recorded.`,
+    });
+  }
 
   // E2: route a completed thinker's report — answer the asking child, or
   // escalate its finding upward (unparsable is an escalation, never a re-think).
@@ -787,6 +1072,15 @@ export function mapAnswers(answers, req) {
   }
 
   if (done >= 0.5 || next === "report_done") {
+    // No successful convergence with unresolved operations: a live child
+    // (running, interrupted-but-live, or resumed) blocks the done report.
+    const live = workers.filter((w) => w.running);
+    if (live.length > 0) {
+      return {
+        say: `Holding: ${live.map((w) => `"${w.name}" (${w.state})`).join(", ")} still live — waiting for their results.`,
+        calls: [],
+      };
+    }
     // Converge: the report the parent receives is every worker's report, not a stub.
     return {
       terminal: true,
