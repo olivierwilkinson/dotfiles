@@ -1106,10 +1106,16 @@ export function mapAnswers(answers, req) {
 
   if ((done >= 0.5 || next === "report_done") && ledger.unresolved.length) {
     const unresolved = [...new Set(ledger.unresolved)].sort();
-    const key = `unresolved-operations:${unresolved.join(",")}`;
-    if (escalationSent(req.events, key, receipts)) {
-      return { say: `Holding: unresolved operations ${unresolved.join(", ")} need reconciliation.`, calls: [] };
+    const hold = { say: `Holding: unresolved operations ${unresolved.join(", ")} need reconciliation.`, calls: [] };
+    // The provider commits terminal state BEFORE executing the tool call, so
+    // escalateAction's refused-subagent_done fallback would latch the engine
+    // finished before acknowledgement. Without an escalation capability, hold
+    // until reconciliation instead.
+    if (!req.tools.some((t) => t.name === "escalate" || t.name === "subagent_ask_parent")) {
+      return hold;
     }
+    const key = `unresolved-operations:${unresolved.join(",")}`;
+    if (escalationSent(req.events, key, receipts)) return hold;
     return escalateAction(req, {
       key, title: "Orchestration operations need reconciliation",
       body: `Goal completion is blocked by unresolved operations: ${unresolved.join(", ")}. Reconcile their outcomes before proceeding.`,
