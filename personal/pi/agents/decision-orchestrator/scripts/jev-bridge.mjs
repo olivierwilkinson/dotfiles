@@ -28,7 +28,7 @@ import { createJiti } from "@mariozechner/jiti";
 const JEV_EXTENSION =
   "/Users/olivier/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/index.ts";
 // Bump when the extension must distinguish a pinned, older bridge process.
-export const BRIDGE_VERSION = 3;
+export const BRIDGE_VERSION = 4;
 if (process.argv.includes("--version")) {
   process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
   process.exit(0);
@@ -144,10 +144,14 @@ const subagentsPath = process.env.JEV_SUBAGENTS_PATH ?? join(
 let orchestrationJournal;
 let completionDecisions;
 let sessionMessages;
+let statusReconciliation;
+let briefSlots;
 try {
   orchestrationJournal = await jiti.import(join(subagentsPath, "orchestration-journal.ts"));
   completionDecisions = await jiti.import(join(subagentsPath, "completion-decisions.ts"));
   sessionMessages = await jiti.import(join(subagentsPath, "session-messages.ts"));
+  statusReconciliation = await jiti.import(join(subagentsPath, "status-reconciliation.ts"));
+  briefSlots = await jiti.import(join(subagentsPath, "brief-slots.ts"));
 } catch (err) {
   fail(`Cannot load shared orchestration modules from JEV_SUBAGENTS_PATH=${subagentsPath}. ` +
     `Update the installed subagents extension and reload sessions before activating this bridge, ` +
@@ -204,6 +208,7 @@ export function migrateLegacyWorkers(receipts, legacyRows) {
 function purposeOfCall(call) {
   if (call?.tool !== "subagent") return undefined;
   const task = String(call.args?.task ?? "");
+  if (/scout_for: (\S+)/.test(task)) return "status_scout";
   const thinkerFor = /thinker_for: (\S+)/.exec(task);
   return thinkerFor ? "think" : "work";
 }
@@ -217,7 +222,7 @@ function acknowledged(event) {
  * stable completion ids deduplicate effects; lifecycle guards prevent an old
  * spawn acknowledgement from regressing a newer terminal state.
  */
-export function foldEvents(receipts, events, capabilities) {
+export function foldEvents(receipts, events, capabilities, sessionFile) {
   let changed = false;
   if (capabilities?.completionKind && receipts.operations["protocol:completion-kind"]) {
     delete receipts.operations["protocol:completion-kind"];
@@ -259,7 +264,8 @@ export function foldEvents(receipts, events, capabilities) {
           purpose: purposeOfCall(c),
           attempt: 1,
           taskIds: Array.isArray(c.args?.tasks) && c.args.tasks.every(Number.isInteger) ? c.args.tasks : undefined,
-          askId: /thinker_for: (\S+)/.exec(String(c.args?.task ?? ""))?.[1],
+          askId: /thinker_for: (\S+)/.exec(String(c.args?.task ?? ""))?.[1] ??
+            /scout_for: (\S+)/.exec(String(c.args?.task ?? ""))?.[1],
         });
         if (c.args?.tasks !== undefined && (!Array.isArray(c.args.tasks) || !c.args.tasks.every(Number.isInteger))) {
           Object.assign(receipts.operations[operationId].intent, {
@@ -408,6 +414,23 @@ export function foldEvents(receipts, events, capabilities) {
       }
       receipts.lifecycle[target.childId].report = report.slice(0, 4000);
       changed = true;
+    } else if (e.type === "tool_result" && e.tool === "task") {
+      // P5: a successful `task op:"complete"` resolves the reconciliation
+      // mark(s) for that task — the auditable auto-complete effect.
+      const call = calls.get(e.callId);
+      const args = call?.args ?? {};
+      const details = isRecord(e.details) ? e.details : {};
+      const op = args.op ?? details.op;
+      const completedId = Number(args.id ?? details.id);
+      if (op === "complete" && Number.isInteger(completedId) && acknowledged(e)) {
+        for (const mark of statusReconciliation.pendingStatusReconciliations(receipts)
+          .filter((m) => m.taskId === completedId)) {
+          if (sessionFile) {
+            statusReconciliation.recordStatusReconciled(sessionFile, mark, "auto-completed",
+              ...(typeof args.ref === "string" ? [{ref: args.ref}] : [{}]));
+          }
+        }
+      }
     } else if (e.type === "tool_result") {
       const operation = Object.entries(receipts.operations).find(([key, row]) =>
         key.startsWith("escalation:") && row.intent?.callId === e.callId)?.[1];
@@ -439,7 +462,7 @@ export function mergedWorkers(sessionFile, events, capabilities) {
       // No legacy ledger — a fresh one starts here.
     }
   }
-  foldEvents(receipts, events, capabilities);
+  foldEvents(receipts, events, capabilities, sessionFile);
   const operations = Object.entries(receipts.operations);
   const unresolved = operations.filter(([, operation], index) => {
     const ack = operation.acknowledgement?.infraIssue ? operation.acknowledgement : operation.intent;
@@ -494,6 +517,7 @@ function workerRows(receipts) {
     spawn_failed: row.spawnFailed === true,
     completed: row.state === "completed",
     askId: row.askId ?? null,
+    ask_id: row.askId ?? null,
     task_ids: row.taskIds ?? [],
     resume_eligible: row.resumeEligible === true,
     resumed_from: row.resumedFrom ?? null,
@@ -533,6 +557,7 @@ export function budgetWorkerRows(workers) {
       attempt: w.attempt,
       state: w.state,
       task_ids: w.task_ids,
+      ask_id: w.askId ?? null,
       resume_eligible: w.resume_eligible,
       resumed_from: w.resumed_from,
       resumed_by: w.resumed_by,
@@ -866,15 +891,147 @@ function completionRows(req) {
   return {rows: req.state?.completionDecisions ?? []};
 }
 
+/** The authoritative task snapshot: absent means the provider could not read one; ok:false is a store failure. */
+function taskTreeOf(req) {
+  const tree = req.state?.taskTree;
+  if (tree === undefined) return {available: false};
+  if (!isRecord(tree) || tree.ok !== true) return {available: true, ok: false, error: String(isRecord(tree) ? tree.error : "task snapshot unreadable")};
+  return {available: true, ok: true, tree, byId: new Map((tree.tasks ?? []).map((task) => [task.id, task]))};
+}
+
+/**
+ * P5 reconciliation view over the authoritative task tree: pending marks whose
+ * task is still open are unresolved (scout or decision pending); marks whose
+ * task is already closed resolve mechanically — a completed task needs no
+ * status scout. Store failures are errors, never an empty surface.
+ */
+function reconciliationView(req, receipts) {
+  const treeInfo = taskTreeOf(req);
+  const marks = statusReconciliation.pendingStatusReconciliations(receipts);
+  if (!treeInfo.available) return {available: false, unresolved: marks, resolved: []};
+  if (!treeInfo.ok) return {available: true, storeError: treeInfo.error, unresolved: [], resolved: []};
+  const sessionFile = req.agent?.sessionFile;
+  const resolved = [];
+  const unresolved = [];
+  for (const mark of marks) {
+    const task = treeInfo.byId.get(mark.taskId);
+    if (task && ["done", "replaced"].includes(task.status)) {
+      if (sessionFile) statusReconciliation.recordStatusReconciled(sessionFile, mark, `task already ${task.status}`);
+      resolved.push(mark);
+    } else if (task) unresolved.push({...mark, task});
+  }
+  return {available: true, ok: true, byId: treeInfo.byId, unresolved, resolved};
+}
+
+/** A read-only scout definition from the scoped roster; a writer never scouts by default. */
+function scoutAgent(req) {
+  const roster = Array.isArray(req.roster) ? req.roster : [];
+  const eligible = roster.find((a) => a.name === "scout" || /read-only|read only|scout/i.test(String(a.description ?? "")));
+  return eligible?.name;
+}
+
+/** Completed status-scout verdicts bound to an unresolved mark (malformed verdicts included, flagged). */
+export function scoutVerdicts(workers, reconciliation) {
+  if (!reconciliation.available || reconciliation.storeError) return [];
+  return workers
+    .filter((w) => w.purpose === "status_scout" && w.completed && w.ask_id !== null && w.ask_id !== undefined)
+    .flatMap((w) => {
+      const taskId = Number(w.ask_id);
+      const mark = (reconciliation.unresolved ?? []).find((m) => m.taskId === taskId);
+      return mark ? [{worker: w, mark: {...mark, taskId}, verdict: statusReconciliation.parseScoutStatusReport(w.report)}] : [];
+    });
+}
+
+/** Bounded scout concurrency: scouts in flight or spawning count against the cap. */
+const SCOUT_CONCURRENCY = 2;
+
+function outstandingScouts(workers) {
+  return workers.filter((w) => w.purpose === "status_scout" &&
+    (w.running || (w.state === "spawn_pending" && !w.spawn_failed)));
+}
+
+/** One status-scout dispatch per (child, task): the transcript marker and the ledger row both dedupe. */
+function scoutDispatched(req, workers, taskId) {
+  if (workers.some((w) => w.purpose === "status_scout" && w.ask_id !== null && Number(w.ask_id) === taskId)) return true;
+  return req.events.some((e) => e.type === "decision" && Array.isArray(e.calls) &&
+    e.calls.some((c) => c?.tool === "subagent" && String(c.args?.task ?? "").includes(`scout_for: ${taskId}`)));
+}
+
+/** The mechanical scout spawn: slot brief with verbatim task text, evidence pointers and the {status} contract — never `tasks` (the scout never acquires the task). */
+export function scoutSpawnCall(req, mark) {
+  const agent = scoutAgent(req);
+  if (!agent) return null;
+  const cwd = req.agent?.cwd ?? process.cwd();
+  const artifactRoot = process.env.PI_SUBAGENT_ARTIFACT_ROOT ?? cwd;
+  const task = mark.task;
+  let envelope;
+  try {
+    envelope = briefSlots.spawnEnvelope(agent, {
+      id: `status-scout:${mark.childId}:${mark.taskId}`, purpose: "status_scout",
+      name: `Task ${mark.taskId} status: ${task.text.slice(0, 48).trim()}`,
+      taskText: `Task #${mark.taskId} (stream ${task.stream ?? "unattached"}): ${task.text}\n\nDetermine this task's actual status by inspecting the evidence read-only. Do not implement, fix or acquire the task.`,
+      cwd, artifactRoot, lineage: [],
+      reports: [...(mark.reportPath ? [{path: mark.reportPath, childId: mark.childId}] : []),
+        ...(task.ref && task.ref.startsWith("/") ? [{path: task.ref}] : [])],
+    });
+  } catch {
+    return null;
+  }
+  return {
+    say: `Dispatching a status scout for task #${mark.taskId} ("${task.text.slice(0, 60)}").`,
+    calls: [{
+      tool: "subagent",
+      args: {...envelope, task: `${envelope.task}\n\nscout_for: ${mark.taskId}\n\nReport EXACTLY one JSON object and your supporting evidence:\n\`\`\`json\n{"status": "open" | "in_progress" | "done" | "blocked" | "replaced"}\n\`\`\`\nThe status enum is the task system's TaskStatus. Your evidence goes in the durable report, never inside the JSON.`},
+      reason: `status scout for the unresolved task #${mark.taskId} of a completed child`,
+    }],
+  };
+}
+
+/** Unresolved reconciliation marks for the current request (empty when the tree is unavailable). */
+function reconciliationAvailable(req, receipts) {
+  const view = reconciliationView(req, receipts);
+  return view.available && !view.storeError ? view.unresolved : [];
+}
+
+/** Worker-arm dispatch for one open task: tasks:[id], stream, explicit cwd and slot brief. */
+export function taskDispatchCall(req, task, agentType, reason) {
+  if (!task || task.status !== "open") return null;
+  const cwd = req.agent?.cwd ?? process.cwd();
+  const artifactRoot = process.env.PI_SUBAGENT_ARTIFACT_ROOT ?? cwd;
+  let envelope;
+  try {
+    envelope = briefSlots.spawnEnvelope(agentType, {
+      id: `task:${task.id}`, purpose: "work",
+      name: `Task ${task.id}: ${task.text.slice(0, 48).trim()}`,
+      taskText: `Work exactly this task from the authoritative task tree:\n\nTask #${task.id}: ${task.text}${task.ref ? `\nArtifact reference: ${task.ref}` : ""}`,
+      cwd, artifactRoot, lineage: [], taskIds: [task.id],
+      ...(task.stream !== undefined ? {stream: task.stream} : {}),
+    });
+  } catch {
+    return null;
+  }
+  return {
+    say: `Dispatching a worker arm for task #${task.id} ("${task.text.slice(0, 60)}").`,
+    calls: [{tool: "subagent", args: envelope, reason}],
+  };
+}
+
 export function buildRequest(req) {
   const goal = resolveGoal(req.events);
-  const { rows: workers, ledger } = mergedWorkers(req.agent?.sessionFile, req.events, req.capabilities);
+  const { rows: workers, ledger, receipts } = mergedWorkers(req.agent?.sessionFile, req.events, req.capabilities);
   const asks = pendingAsks(req.events);
   const carriers = goalForState(goal, req.agent?.sessionFile);
   const doneCalled = doneAlreadyCalled(req.events);
   const agentQuestion = workerAgentQuestion(req);
   const targetQuestion = checkInTargetQuestion(workers);
   const completion = completionRows(req).rows.find((row) => row.status === 'offered' && completionDecisions.isPendingCompletion(row));
+  // P5: reconciliation over the authoritative task tree, and the P4 join —
+  // committed task-update decisions surface as finite options.
+  const reconciliation = reconciliationView(req, receipts);
+  const taskUpdateDecision = Array.isArray(req.state?.sessionMessages?.taskUpdates)
+    ? req.state.sessionMessages.taskUpdates[0] : undefined;
+  const scoutVerdict = scoutVerdicts(workers, reconciliation)
+    .find(({mark, verdict}) => verdict !== undefined);
   return {
     model: MODEL,
     state: {
@@ -892,6 +1049,13 @@ export function buildRequest(req) {
         .map((w) => ({ name: w.name, agent: w.agent })),
       done_already_reported: doneCalled,
       completion_decisions: completionRows(req),
+      task_tree: req.state?.taskTree ?? null,
+      pending_reconciliations: reconciliation.available
+        ? (reconciliation.storeError
+          ? {store_error: reconciliation.storeError}
+          : reconciliation.unresolved.map((mark) => ({child_id: mark.childId, task_id: mark.taskId,
+            revision: mark.revision, task_status: mark.task.status, task_text: mark.task.text, report_path: mark.reportPath ?? null})))
+        : {unavailable: true},
       recent_events: digestEvents(req.events),
       run_state: req.state ?? null,
       // A corrupt or unwritable ledger blocks convergence (never a silent
@@ -904,6 +1068,17 @@ export function buildRequest(req) {
     questions: {
       ...(completion ? {completion_decision: {type: 'choice', instructions: 'Choose exactly one offered completion option. Approval authorizes only its admitted sequential actions; human approval is a separate ask action.',
         criteria: Object.fromEntries(completion.offer.decisions.map((option) => [option.id, option.description]))}} : {}),
+      // P4 join: a committed parent task-update decision (escalate always appended by the adapter).
+      ...(taskUpdateDecision ? {task_update_decision: {type: 'choice',
+        instructions: `A committed parent task-update (revision ${taskUpdateDecision.revision}) needs reconciliation. Choose exactly one offered option; escalation is always available.`,
+        criteria: Object.fromEntries(taskUpdateDecision.options.map((option) => [option.id, option.description]))}} : {}),
+      // P5: a non-done status-scout verdict routes a finite decision; `done` auto-completes mechanically.
+      ...(scoutVerdict && scoutVerdict.verdict.status !== "done" ? {task_reconciliation: {type: 'choice',
+        instructions: `Status scout for task #${scoutVerdict.mark.taskId} ("${scoutVerdict.mark.task.text.slice(0, 80)}") reports "${scoutVerdict.verdict.status}". Choose exactly one reconciliation; escalate is always available.`,
+        criteria: {
+          redispatch_task: `Spawn a worker arm for task #${scoutVerdict.mark.taskId}: tasks:[id], stream, explicit cwd and slot brief.`,
+          escalate: "Escalate the scout verdict for parent/user reconciliation.",
+        }}} : {}),
       done: {
         type: "noul",
         instructions:
@@ -1037,6 +1212,51 @@ export function mapAnswers(answers, req) {
       offerHash: offer.offerHash, reportRef: offer.reportRef, optionId}, reason: 'finite completion option selected'}]};
   }
 
+  // P4 join: a committed parent task-update decision offers finite options with
+  // escalate always appended. Selection executes its one typed action; nothing
+  // here re-mutates the committed batch.
+  const taskUpdateDecision = Array.isArray(req.state?.sessionMessages?.taskUpdates)
+    ? req.state.sessionMessages.taskUpdates[0] : undefined;
+  if (taskUpdateDecision) {
+    const updateKey = inboxKey("tu", taskUpdateDecision.id);
+    if (!Object.hasOwn(answers, "task_update_decision")) {
+      return {say: "Task-update decision arrived during classification; waiting for its notice.", calls: []};
+    }
+    const chosen = taskUpdateDecision.options.find((option) => option.id === answers.task_update_decision?.choice);
+    if (!chosen || chosen.id === "__escalate__") {
+      if (escalationSent(req.events, updateKey, receipts)) {
+        return {say: "Task-update escalation already sent; waiting for reconciliation.", calls: []};
+      }
+      return escalateAction(req, {key: updateKey, title: "Task update needs reconciliation",
+        body: `Committed task update ${taskUpdateDecision.operationId} (revision ${taskUpdateDecision.revision}) needs judgement:\n${taskUpdateDecision.correction}`});
+    }
+    for (const action of chosen.actions ?? []) {
+      if (action.type === "task.update") {
+        if (!req.tools.some((tool) => tool.name === "task_update")) {
+          return escalateAction(req, {key: updateKey, infrastructureIssue: true, title: "Task update executor unavailable",
+            body: `NOT reconciled. Reload with task_update. Decision ${taskUpdateDecision.id}, revision ${taskUpdateDecision.revision}.`});
+        }
+        return {say: `Applying the revision-bound task update (${taskUpdateDecision.operationId}).`,
+          calls: [{tool: "task_update", args: action.input, reason: "executed the committed task-update decision"}]};
+      }
+      if (action.type === "task.dispatch") {
+        const treeInfo = taskTreeOf(req);
+        if (treeInfo.available && treeInfo.ok) {
+          for (const taskId of action.taskIds ?? []) {
+            const dispatch = taskDispatchCall(req, treeInfo.byId.get(taskId), agentType,
+              "dispatch the committed task update to a worker arm");
+            if (dispatch) return dispatch;
+          }
+        }
+      }
+    }
+    if (escalationSent(req.events, updateKey, receipts)) {
+      return {say: "Task-update escalation already sent; waiting for reconciliation.", calls: []};
+    }
+    return escalateAction(req, {key: updateKey, title: "Task update option is not executable",
+      body: `Option ${chosen.id} on decision ${taskUpdateDecision.id} carries no executable action here; reconcile manually.`});
+  }
+
   // Mechanical dead-end: repeated failed spawns never resolve by asking the
   // classifier again (self-spawn blocks, bad agent choices, missing cwd).
   const failures = trailingSpawnFailures(req.events);
@@ -1052,6 +1272,95 @@ export function mapAnswers(answers, req) {
         },
       ],
     };
+  }
+
+  // P5: authoritative task reconciliation. The task tree drives everything:
+  // store failures are errors (never an empty success); already-closed tasks
+  // resolve mechanically; a completed child's open task gets ONE status scout
+  // (bounded concurrency); exited/killed orphans stay with lifecycle recovery.
+  const reconciliation = reconciliationView(req, receipts);
+  if (reconciliation.available && reconciliation.storeError) {
+    const key = inboxKey("ts", reconciliation.storeError);
+    if (!escalationSent(req.events, key, receipts)) {
+      return escalateAction(req, {key, infrastructureIssue: true, title: "Task store unavailable for reconciliation",
+        body: `NOT reconciled. The authoritative task snapshot failed: ${reconciliation.storeError}. No scout or dispatch may run on an unreadable tree.`});
+    }
+    return {say: "Task-store escalation already sent; waiting for reconciliation.", calls: []};
+  }
+  if (reconciliation.available) {
+    const verdicts = scoutVerdicts(workers, reconciliation);
+    const malformed = verdicts.find(({verdict}) => verdict === undefined);
+    if (malformed) {
+      const key = inboxKey("sc", `${malformed.worker.child_id}:${malformed.mark.taskId}`);
+      if (!escalationSent(req.events, key, receipts)) {
+        return escalateAction(req, {key, infrastructureIssue: true, title: "Status scout report is unusable",
+          body: `NOT reconciled. Scout ${malformed.worker.child_id} returned no strict {"status"} verdict for task #${malformed.mark.taskId}. Malformed, flagged and stale scout results are never success. Report: ${malformed.worker.report_path ?? "(none)"}`});
+      }
+    }
+    const verdict = verdicts.find(({verdict}) => verdict !== undefined);
+    if (verdict) {
+      const {worker, mark} = verdict;
+      const status = verdict.verdict.status;
+      const scoutRef = worker.report_path ?? undefined;
+      // `done` auto-completes only after the recheck: status still open, the
+      // task revision unchanged since the mark, and an evidence ref present.
+      // `replaced` alone can never bypass replacement-chain validation.
+      const eligible = status === "done" && mark.task.status === "open" &&
+        (mark.taskRevision === undefined || mark.task.revision === undefined || mark.task.revision === mark.taskRevision) &&
+        Boolean(scoutRef);
+      if (eligible) {
+        if (!req.tools.some((tool) => tool.name === "task")) {
+          return escalateAction(req, {key: inboxKey("sc", String(mark.taskId)), infrastructureIssue: true,
+            title: "Task service unavailable for auto-completion",
+            body: `NOT reconciled. Reload with the task tool to complete task #${mark.taskId}. Scout report: ${scoutRef}`});
+        }
+        return {
+          say: `Status scout confirmed task #${mark.taskId} done; completing it with the scout report as the evidence ref.`,
+          calls: [{
+            tool: "task",
+            args: {op: "complete", id: mark.taskId, ref: scoutRef},
+            reason: "scout done verdict auto-completes the task through the shared task service",
+          }],
+        };
+      }
+      if (!Object.hasOwn(answers, "task_reconciliation")) {
+        return {say: "Status scout verdict arrived during classification; waiting for its notice.", calls: []};
+      }
+      if (answers.task_reconciliation?.choice === "redispatch_task") {
+        const agentType = answers.worker_agent?.choice && answers.worker_agent.choice !== "other"
+          ? answers.worker_agent.choice : "worker";
+        const dispatch = taskDispatchCall(req, mark.task, agentType,
+          `status scout verdict "${status}" routed to a worker arm`);
+        if (dispatch) return dispatch;
+      }
+      const key = inboxKey("sc", `${worker.child_id}:${mark.taskId}`);
+      if (escalationSent(req.events, key, receipts)) {
+        return {say: "Reconciliation escalation already sent; waiting for the user.", calls: []};
+      }
+      return escalateAction(req, {key, title: `Task #${mark.taskId} reconciliation needs judgement`,
+        body: `Status scout verdict: ${JSON.stringify(verdict.verdict)}. Task #${mark.taskId} ("${mark.task.text}") is "${mark.task.status}"` +
+          `${mark.task.revision !== undefined ? ` at revision ${mark.task.revision}` : ""}` +
+          `${mark.taskRevision !== undefined ? ` (marked at task revision ${mark.taskRevision})` : ""}. ` +
+          `Scout report: ${worker.report_path ?? "(none)"}. Original child: ${mark.childId}.`});
+    }
+    // Dispatch scouts mechanically for unresolved done-claims.
+    const inFlight = outstandingScouts(workers).length;
+    for (const mark of reconciliation.unresolved) {
+      if (inFlight >= SCOUT_CONCURRENCY) break;
+      if (scoutDispatched(req, workers, mark.taskId)) continue;
+      const row = receipts.lifecycle[mark.childId];
+      if (!row || row.state !== "completed") continue; // exited/killed orphans route through lifecycle recovery (P6)
+      const spawn = scoutSpawnCall(req, mark);
+      if (spawn) return spawn;
+      if (!scoutAgent(req)) {
+        const key = inboxKey("sa", String(mark.taskId));
+        if (!escalationSent(req.events, key, receipts)) {
+          return escalateAction(req, {key, infrastructureIssue: true, title: "No eligible scout definition",
+            body: `NOT reconciled. No read-only scout definition exists in this session's roster to verify task #${mark.taskId}; a writer definition must not scout by default.`});
+        }
+      }
+      break;
+    }
   }
 
   // E2: route a completed thinker's report — answer the asking child, or
@@ -1194,6 +1503,16 @@ export function mapAnswers(answers, req) {
         calls: [],
       };
     }
+    // P5: no successful convergence with unresolved task reconciliation or
+    // status scouting still in flight.
+    const reconciliation = reconciliationView(req, receipts);
+    const outstanding = reconciliation.available && !reconciliation.storeError ? reconciliation.unresolved : [];
+    if (outstanding.length > 0 || outstandingScouts(workers).length > 0) {
+      return {
+        say: `Holding: task reconciliation is outstanding (${outstanding.map((mark) => `#${mark.taskId}`).join(", ")} or status scouting in flight).`,
+        calls: [],
+      };
+    }
     const incomplete = workers.filter((w) => w.purpose !== "think" &&
       ["exited-without-done", "failed"].includes(w.state) && !completedResume(workers, w));
     if (incomplete.length || !workers.some((w) => w.completed && w.report)) {
@@ -1250,6 +1569,19 @@ export function mapAnswers(answers, req) {
     // ride along — dependent pipelines (plan → implement) need the prior
     // stage's output, and forwarding it is mechanical, not generative.
     const name = `Worker ${workers.length + 1}`;
+    // P5: dispatch is task-driven — eligible open tasks from the authoritative
+    // snapshot ride as tasks:[id] with stream, cwd and a slot brief. Tasks with
+    // a pending reconciliation mark are reserved for the scout flow, tasks
+    // owned by live children are never double-dispatched, and no task is ever
+    // invented from report prose.
+    const treeInfo = taskTreeOf(req);
+    const reserved = new Set(reconciliationAvailable(req, receipts).map((mark) => mark.taskId));
+    const owned = new Set(workers.filter((w) => w.running).flatMap((w) => w.task_ids ?? []));
+    const eligibleTask = treeInfo.available && treeInfo.ok
+      ? treeInfo.tree.tasks.find((task) => task.status === "open" &&
+          (!task.assignedToId || task.assignedToId === req.agent?.id) &&
+          !reserved.has(task.id) && !owned.has(task.id))
+      : undefined;
     const prior = workers.filter((w) => w.completed && w.report);
     const priorBlock =
       prior.length > 0
@@ -1265,6 +1597,8 @@ ${w.report.trim().slice(0, 1500)}`)
       `You are ${name}: do the work below in one pass. Instructions about orchestrating, waiting, converging, or reporting upward are for your parent, not you — finish by calling subagent_done with your report.\n\n` +
       goal +
       priorBlock.slice(0, 4000);
+    const dispatched = eligibleTask ? taskDispatchCall(req, eligibleTask, agentType, "task-driven worker-arm dispatch") : null;
+    if (dispatched) return dispatched;
     return {
       say: `Spawning ${name} (${agentType}) for the goal.`,
       calls: [
