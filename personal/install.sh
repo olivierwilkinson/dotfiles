@@ -22,11 +22,13 @@ $RESET"
   link_config ~/dotfiles/personal/tmuxinator ~/.config/tmuxinator
   link_config ~/dotfiles/personal/zellij ~/.config/zellij
 
-  # Pi agent definitions + subagents config — Shopify work machine with pi installed only
+  # Pi agent definitions, subagents config + local extensions — Shopify work machine only
   if [[ -d $HOME/.pi && -d /opt/dev ]]; then
     link_config ~/dotfiles/personal/pi/agents ~/.pi/agent/agents
     link_config ~/dotfiles/personal/pi/modes ~/.pi/agent/modes
     link_config ~/dotfiles/personal/pi/subagents-config ~/.pi/agent/config/subagents
+    mkdir -p "$HOME/.pi/agent/extensions"
+    ln -sfn ~/dotfiles/personal/pi/extensions/lmtools-code.ts "$HOME/.pi/agent/extensions/lmtools-code.ts"
   fi
 
   # herdr: link the config FILE only (runtime state lives in ~/.config/herdr itself),
