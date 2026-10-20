@@ -229,7 +229,9 @@ export function foldEvents(receipts, events, capabilities) {
           : /escalation_for: ([^\s)]+)/.exec(String(c?.args?.question ?? c?.args?.result ?? ""))?.[1]?.replace(/:$/, "");
         if (escalationKey) {
           const operationId = `escalation:${escalationKey}`;
-          if (!receipts.operations[operationId]) {
+          const operation = receipts.operations[operationId];
+          // Retry receipts track the latest attempt until one is accepted.
+          if (!operation || (operation.acknowledgement?.isError !== false && operation.intent?.callId !== c.id)) {
             receipts.operations[operationId] = { intent: { phase: "intent", tool: c.tool, callId: c.id } };
             changed = true;
           }
@@ -603,18 +605,20 @@ function thinkerDispatched(events, askId) {
 }
 
 function escalationSent(events, askId, receipts) {
-  return (
-    Boolean(receipts?.operations[`escalation:${askId}`]) ||
-    dispatchedWithMarker(events, "subagent_ask_parent", `escalation_for: ${askId}`) ||
-    events.some((e) => e.type === "decision" && e.calls?.some((c) =>
-      c?.tool === "subagent_done" && String(c.args?.result ?? "").includes(`escalation_for: ${askId}`))) ||
-    events.some(
-      (e) =>
-        e.type === "decision" &&
-        Array.isArray(e.calls) &&
-        e.calls.some((c) => c?.tool === "escalate" && String(c.args?.key ?? "") === askId),
-    )
-  );
+  if (receipts?.operations[`escalation:${askId}`]?.acknowledgement?.isError === false) return true;
+  // Corrupt/unwritable ledgers cannot persist receipts, so also check the
+  // transcript. Intent alone (or a rejected acknowledgement) is never sent.
+  return events.some((e) => e.type === "decision" && e.calls?.some((c) => {
+    const matches = c?.tool === "escalate" ? String(c.args?.key ?? "") === askId
+      : ["subagent_ask_parent", "subagent_done"].includes(c?.tool) &&
+        String(c.args?.question ?? c.args?.result ?? "").includes(`escalation_for: ${askId}`);
+    return matches && events.some((result) =>
+      result.type === "tool_result" && result.callId === c.id && acknowledged(result));
+  }));
+}
+
+function inboxKey(prefix, identity) {
+  return `${prefix}-${createHash("sha256").update(identity).digest("hex").slice(0, 16)}`;
 }
 
 /** E2: the thinker's verdict — first JSON object in the report, prose tolerated. */
@@ -700,7 +704,7 @@ function escalateAction(req, { key, title, body, markerAskId, forwardAskId = nul
           result:
             `ESCALATION REQUEST${marker ? ` (${marker})` : ""}: ${title}\n\n` +
             `Goal was NOT completed — this is an escalation request needing the user, not a completion report.\n\n` +
-            (key.startsWith("ledger-corrupt:") ? `While the orchestration ledger is corrupt or unwritable, this subagent_done call will be REFUSED by the extension ` +
+            (key.startsWith("lc-") ? `While the orchestration ledger is corrupt or unwritable, this subagent_done call will be REFUSED by the extension ` +
               `(fail closed); no completion can be recorded.\n\n` : "") + body,
         },
         reason: "no escalate/ask_parent capability; terminal escalation report",
@@ -997,9 +1001,9 @@ export function mapAnswers(answers, req) {
         ? `orchestration ledger write failed: ${ledger.writeError}`
         : `orchestration control unresolved: ${ledger.operationError}`;
     const key = ledger.corrupt || ledger.writeError
-      ? `ledger-corrupt:${createHash("sha256").update(problem).digest("hex").slice(0, 16)}`
-      : `${ledger.operationErrorIds.every((id) => id.startsWith("protocol:"))
-        ? "protocol-completion-kind" : "ledger-operation"}:${ledger.operationErrorIds.join(",")}`;
+      ? inboxKey("lc", problem)
+      : inboxKey(ledger.operationErrorIds.every((id) => id.startsWith("protocol:"))
+        ? "pck" : "lo", [...ledger.operationErrorIds].sort().join(","));
     if (escalationSent(req.events, key, receipts)) {
       return { say: "Ledger escalation already sent; waiting for reconciliation.", calls: [] };
     }
@@ -1114,7 +1118,7 @@ export function mapAnswers(answers, req) {
     if (!req.tools.some((t) => t.name === "escalate" || t.name === "subagent_ask_parent")) {
       return hold;
     }
-    const key = `unresolved-operations:${unresolved.join(",")}`;
+    const key = inboxKey("uo", unresolved.join(","));
     if (escalationSent(req.events, key, receipts)) return hold;
     return escalateAction(req, {
       key, title: "Orchestration operations need reconciliation",
@@ -1155,7 +1159,7 @@ export function mapAnswers(answers, req) {
     const incomplete = workers.filter((w) => w.purpose !== "think" &&
       ["exited-without-done", "failed"].includes(w.state) && !completedResume(workers, w));
     if (incomplete.length || !workers.some((w) => w.completed && w.report)) {
-      const key = `workers-incomplete:${incomplete.map((w) => w.child_id).sort().join(",") || "no-reports"}`;
+      const key = inboxKey("wi", incomplete.map((w) => w.child_id).sort().join(",") || "no-reports");
       if (escalationSent(req.events, key, receipts)) {
         return { say: "Incomplete-worker escalation already sent; waiting for reconciliation.", calls: [] };
       }
