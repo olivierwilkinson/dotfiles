@@ -386,13 +386,14 @@ export function foldEvents(receipts, events) {
       if (!successful) continue;
       let state = e.tool === "subagent_kill" ? "killed" : e.tool === "subagent_interrupt" ? "interrupted" : "resumed";
       if (details.status !== undefined) {
-        const allowed = e.tool === "subagent_kill" ? ["killed", "exited-without-done"] : [state];
+        const allowed = e.tool === "subagent_kill" ? ["killed", "exited-without-done"]
+          : e.tool === "subagent_interrupt" ? ["interrupted", "interrupt_requested"] : ["resumed", "started"];
         if (!allowed.includes(details.status)) {
           operation.acknowledgement.infraIssue = true;
           operation.acknowledgement.error = `unexpected ${e.tool} status: ${details.status}`;
           continue;
         }
-        state = details.status;
+        if (e.tool === "subagent_kill") state = details.status;
       }
       const rows = Object.values(receipts.lifecycle);
       const byId = args.id ?? args.subagentId ?? (e.tool !== "subagent_resume" ? details.id ?? details.childId : undefined);
@@ -730,7 +731,9 @@ function escalateAction(req, { key, title, body, markerAskId, forwardAskId = nul
         args: {
           result:
             `ESCALATION REQUEST${marker ? ` (${marker})` : ""}: ${title}\n\n` +
-            `Goal was NOT completed — this result needs the user's attention, not a merge.\n\n${body}`,
+            `Goal was NOT completed — this is an escalation request needing the user, not a completion report.\n\n` +
+            `While the orchestration ledger is corrupt or unwritable, this subagent_done call will be REFUSED by the extension ` +
+            `(fail closed); no completion can be recorded.\n\n${body}`,
         },
         reason: "no escalate/ask_parent capability; terminal escalation report",
       },
@@ -1021,8 +1024,8 @@ export function mapAnswers(answers, req) {
       key: "ledger-corrupt",
       title: "Decision orchestrator cannot trust its worker ledger",
       body:
-        `${problem}. The run was NOT completed — worker lifecycle state cannot be proven, ` +
-        `so no convergence or task completion may be recorded.`,
+        `${problem}. The run cannot record success on an untrusted ledger — worker lifecycle state cannot be proven, ` +
+        `so no convergence or task completion may be recorded. This escalation request needs the user.`,
     });
   }
 
