@@ -24,6 +24,8 @@ import { createJiti } from "@mariozechner/jiti";
 
 const JEV_EXTENSION =
   "/Users/olivier/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/index.ts";
+// Bump when the extension must distinguish a pinned, older bridge process.
+export const BRIDGE_VERSION = 2;
 const MODEL = process.env.JEV_MODEL || "jev-latest";
 const OUTPUT_LIMIT = 400;
 // Parent-authored text (goals, mid-run parent messages) rides at 2000 so the
@@ -178,28 +180,51 @@ function applyLifecycle(receipts, childId, state, ts, fields = {}) {
   return true;
 }
 
+const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
 function mergeReceipts(target, raw) {
-  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return { ok: false, error: "unrecognized .orch.json shape" };
+  if (!isRecord(raw)) return { ok: false, error: "unrecognized .orch.json shape" };
   if (raw.v !== 1) return { ok: false, error: `unknown .orch.json version ${raw.v}` };
-  if (raw.lifecycle != null && (typeof raw.lifecycle !== "object" || Array.isArray(raw.lifecycle))) {
-    return { ok: false, error: "malformed .orch.json lifecycle" };
+  // Validate the whole ledger before merging anything. Missing collections
+  // are ambiguous state, not evidence that no work or effects exist.
+  if (!isRecord(raw.lifecycle) || !isRecord(raw.operations) || !isRecord(raw.resumeReservations) ||
+      !Array.isArray(raw.consumedCompletions) || raw.consumedCompletions.some((id) => typeof id !== "string") ||
+      !Number.isSafeInteger(raw.foldedEventCount) || raw.foldedEventCount < 0) {
+    return { ok: false, error: "malformed .orch.json collections or event count" };
   }
-  for (const [childId, row] of Object.entries(raw.lifecycle ?? {})) {
-    if (!row || typeof row !== "object" || !LIFECYCLE_STATES.includes(row.state)) {
+  for (const [childId, row] of Object.entries(raw.lifecycle)) {
+    if (!isRecord(row) || !childId || row.childId !== childId || !LIFECYCLE_STATES.includes(row.state) ||
+        !Number.isFinite(row.stateTs) || row.stateTs < 0) {
       return { ok: false, error: "malformed .orch.json lifecycle row" };
     }
+  }
+  for (const operation of Object.values(raw.operations)) {
+    if (!isRecord(operation) || Object.entries(operation).some(([phase, record]) =>
+      !["intent", "acknowledgement", "effect"].includes(phase) || !isRecord(record) || record.phase !== phase)) {
+      return { ok: false, error: "malformed .orch.json operation" };
+    }
+  }
+  for (const reservation of Object.values(raw.resumeReservations)) {
+    if (!isRecord(reservation) || typeof reservation.childId !== "string" || typeof reservation.sessionFile !== "string" ||
+        !Number.isSafeInteger(reservation.attempt) || reservation.attempt < 1 || !Number.isFinite(reservation.reservedAt)) {
+      return { ok: false, error: "malformed .orch.json resume reservation" };
+    }
+  }
+  for (const [childId, row] of Object.entries(raw.lifecycle)) {
     const existing = target.lifecycle[childId];
     // A durable terminal state stands: an older spawn row never overwrites it.
-    if (!existing || row.stateTs >= existing.stateTs) target.lifecycle[childId] = row;
+    if (!existing || (row.stateTs >= existing.stateTs && canTransition(existing.state, row.state))) {
+      target.lifecycle[childId] = row;
+    }
   }
-  for (const [id, operation] of Object.entries(raw.operations ?? {})) {
+  for (const [id, operation] of Object.entries(raw.operations)) {
     target.operations[id] = { ...operation, ...target.operations[id] };
   }
-  for (const id of raw.consumedCompletions ?? []) {
+  for (const id of raw.consumedCompletions) {
     if (!target.consumedCompletions.includes(id)) target.consumedCompletions.push(id);
   }
-  Object.assign(target.resumeReservations, raw.resumeReservations ?? {});
-  target.foldedEventCount = Math.max(target.foldedEventCount, raw.foldedEventCount ?? 0);
+  Object.assign(target.resumeReservations, raw.resumeReservations);
+  target.foldedEventCount = Math.max(target.foldedEventCount, raw.foldedEventCount);
   return { ok: true };
 }
 
@@ -211,8 +236,9 @@ export function readOrchReceipts(sessionFile) {
   let raw;
   try {
     raw = readFileSync(`${sessionFile}.orch.json`, "utf8");
-  } catch {
-    return { receipts, corrupt: false };
+  } catch (error) {
+    if (error?.code === "ENOENT") return { receipts, corrupt: false };
+    return { receipts, corrupt: true, error: `.orch.json read failed: ${error?.message ?? error}` };
   }
   let parsed;
   try {
@@ -273,6 +299,18 @@ function purposeOfCall(call) {
   return thinkerFor ? "think" : "work";
 }
 
+// Mirror the shared acknowledgement contract for direct/legacy bridge callers
+// too: structured refusals and infrastructure failures override display text.
+function acknowledged(event) {
+  const details = isRecord(event.details) ? event.details : {};
+  return !event.isError && event.acknowledgement?.successful !== false &&
+    !["error", "blocked", "schemaViolated", "schemaFailure", "schemaError", "refused", "aborted",
+      "infraIssue", "receiptError", "corrupt"].some((key) => details[key]) &&
+    details.success !== false && details.ok !== false &&
+    !["blocked", "refused", "schema_failure", "schema_failed", "error"].includes(details.status) &&
+    !details.handoff?.schemaViolated && !(Array.isArray(details.schemaErrors) && details.schemaErrors.length > 0);
+}
+
 /**
  * Fold transcript events onto the receipts. Events only ADD: each index folds
  * once (`foldedEventCount` guards replay after reload), and lifecycle moves
@@ -308,30 +346,56 @@ export function foldEvents(receipts, events) {
       const operationId = `spawn:${e.callId}`;
       const intent = receipts.operations[operationId]?.intent;
       if (!intent || receipts.operations[operationId].acknowledgement) continue;
-      receipts.operations[operationId].acknowledgement = { phase: "acknowledgement", isError: Boolean(e.isError) };
+      const successful = acknowledged(e);
+      receipts.operations[operationId].acknowledgement = { phase: "acknowledgement", isError: !successful };
+      changed = true;
       const key = intent.childKey;
       const row = receipts.lifecycle[key];
-      if (e.isError) {
-        if (row) {
-          row.spawnFailed = true;
-          changed = true;
-        }
+      if (!successful) {
+        if (row) row.spawnFailed = true;
         continue;
       }
-      const childId = /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1];
-      if (childId && row) {
-        delete receipts.lifecycle[key];
-        receipts.lifecycle[childId] = { ...row, childId };
-        applyLifecycle(receipts, childId, "running", Date.now(), {});
+      const childId = e.details?.id ?? /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1];
+      if (typeof childId === "string" && childId && row) {
+        // Never replace an existing stable row with the pending spawn row:
+        // an old acknowledgement cannot resurrect a killed/interrupted child.
+        applyLifecycle(receipts, childId, "running", Date.now(), receipts.lifecycle[childId] ? {} : row);
+        if (key !== childId) delete receipts.lifecycle[key];
         receipts.operations[operationId].acknowledgement.childId = childId;
-        changed = true;
       }
     } else if (e.type === "tool_result" && ["subagent_kill", "subagent_interrupt", "subagent_resume"].includes(e.tool)) {
-      const state = e.tool === "subagent_kill" ? "killed" : e.tool === "subagent_interrupt" ? "interrupted" : "resumed";
       // The control call's args (intent, matched by callId) name the target.
       const args = calls.get(e.callId)?.args ?? {};
+      const details = isRecord(e.details) ? e.details : {};
+      const operationId = args.operationId ?? `control:${e.callId}`;
+      const operation = receipts.operations[operationId] ??= {};
+      // The event cursor is only an optimization: durable per-call effects
+      // also guard duplicate acknowledgements at different transcript indexes.
+      if (operation.effect || operation.acknowledgement) continue;
+      operation.intent ??= { phase: "intent", tool: e.tool, callId: e.callId };
+      const successful = acknowledged(e);
+      operation.acknowledgement = {
+        phase: "acknowledgement", isError: !successful, status: details.status,
+        ...(details.infraIssue || details.receiptError || details.corrupt
+          ? { infraIssue: true, error: String(details.receiptError ?? details.error ?? "control acknowledgement reported infrastructure failure") }
+          : {}),
+      };
+      changed = true;
+      // Only an acknowledged control action moves the ledger; a failed
+      // interrupt/kill leaves the child in its current state.
+      if (!successful) continue;
+      let state = e.tool === "subagent_kill" ? "killed" : e.tool === "subagent_interrupt" ? "interrupted" : "resumed";
+      if (details.status !== undefined) {
+        const allowed = e.tool === "subagent_kill" ? ["killed", "exited-without-done"] : [state];
+        if (!allowed.includes(details.status)) {
+          operation.acknowledgement.infraIssue = true;
+          operation.acknowledgement.error = `unexpected ${e.tool} status: ${details.status}`;
+          continue;
+        }
+        state = details.status;
+      }
       const rows = Object.values(receipts.lifecycle);
-      const byId = args.id ?? args.subagentId;
+      const byId = args.id ?? args.subagentId ?? (e.tool !== "subagent_resume" ? details.id ?? details.childId : undefined);
       const candidates = byId
         ? rows.filter((r) => r.childId === byId)
         : e.tool === "subagent_resume" && args.sessionPath
@@ -343,30 +407,28 @@ export function foldEvents(receipts, events) {
         ? rows.filter((r) => r.state === "exited-without-done")
         : candidates;
       const row = resolved.length === 1 ? resolved[0] : undefined;
-      // Only an acknowledged control action moves the ledger; a failed
-      // interrupt/kill leaves the child in its current state.
-      if (!row || e.isError) continue;
-      if (e.tool === "subagent_resume") {
-        // The resumed attempt is a NEW child on the old session chain: the
-        // old row records the resume, the new row carries attempt+1 and the
-        // preserved purpose.
-        applyLifecycle(receipts, row.childId, "resumed", Date.now(), {});
-        const newChildId = /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1];
-        if (newChildId && newChildId !== row.childId) {
-          receipts.lifecycle[newChildId] = {
-            ...row,
-            childId: newChildId,
-            attempt: (row.attempt ?? 1) + 1,
-            resumedFrom: args.sessionPath ?? row.sessionFile ?? null,
-            state: "resumed",
-            stateTs: Date.now(),
-          };
-        }
-        changed = true;
+      if (!row) {
+        operation.acknowledgement.infraIssue = true;
+        operation.acknowledgement.error = `${e.tool} acknowledgement has no unambiguous lifecycle target`;
         continue;
       }
-      if (!applyLifecycle(receipts, row.childId, state, Date.now())) continue;
-      changed = true;
+      // Claim before applying either half of a resumed attempt. A replay is
+      // an idempotent no-op even when a terminal row rejects the transition.
+      operation.effect = { phase: "effect", tool: e.tool, childId: row.childId, state };
+      if (!applyLifecycle(receipts, row.childId, state, Date.now(),
+        state === "exited-without-done" ? { resumeEligible: details.resumeEligible === true, completionKind: state } : {})) continue;
+      if (e.tool === "subagent_resume") {
+        // The resumed attempt is a NEW child on the old session chain. An
+        // existing newer/terminal row must not be replaced by this old ack.
+        const newChildId = details.id ?? /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1];
+        if (typeof newChildId === "string" && newChildId && newChildId !== row.childId && !receipts.lifecycle[newChildId]) {
+          applyLifecycle(receipts, newChildId, "resumed", Date.now(), {
+            ...row,
+            attempt: (row.attempt ?? 1) + 1,
+            resumedFrom: args.sessionPath ?? row.sessionFile ?? null,
+          });
+        }
+      }
     } else if (e.type === "notification" && e.kind === "subagent_result") {
       const payload = e.payload ?? {};
       const rows = Object.values(receipts.lifecycle);
@@ -421,7 +483,9 @@ export function foldEvents(receipts, events) {
 export function mergedWorkers(sessionFile, events) {
   const loaded = readOrchReceipts(sessionFile);
   const receipts = loaded.receipts;
-  if (!loaded.corrupt && !receipts.foldedEventCount) {
+  const ledger = { corrupt: loaded.corrupt === true, error: loaded.error, writeError: null, operationError: null };
+  if (loaded.corrupt) return { rows: workerRows(receipts), ledger };
+  if (!receipts.foldedEventCount) {
     try {
       const rows = JSON.parse(readFileSync(`${sessionFile}.workers.json`, "utf8"));
       migrateLegacyWorkers(receipts, rows);
@@ -430,10 +494,8 @@ export function mergedWorkers(sessionFile, events) {
     }
   }
   foldEvents(receipts, events);
-  const ledger = { corrupt: loaded.corrupt === true, error: loaded.error, writeError: null };
-  if (loaded.corrupt) {
-    return { rows: workerRows(receipts), ledger };
-  }
+  const unresolved = Object.entries(receipts.operations).find(([, operation]) => operation.acknowledgement?.infraIssue);
+  if (unresolved) ledger.operationError = `${unresolved[0]}: ${unresolved[1].acknowledgement.error}`;
   if (sessionFile) {
     const saved = saveOrchReceipts(sessionFile, receipts);
     if (saved.error) ledger.writeError = saved.error;
@@ -844,6 +906,7 @@ export function buildRequest(req) {
       // empty-ledger fallback): mapAnswers refuses done and escalates.
       ...(ledger.corrupt ? { ledger_corrupt: true, ledger_error: ledger.error } : {}),
       ...(!ledger.corrupt && ledger.writeError ? { ledger_write_error: ledger.writeError } : {}),
+      ...(ledger.operationError ? { ledger_operation_error: ledger.operationError } : {}),
     },
     questions: {
       done: {
@@ -948,10 +1011,12 @@ export function mapAnswers(answers, req) {
 
   // Corrupt or unwritable ledger: convergence may never succeed on an
   // unfaithful picture — stop and infra-escalate instead.
-  if (ledger.corrupt || ledger.writeError) {
+  if (ledger.corrupt || ledger.writeError || ledger.operationError) {
     const problem = ledger.corrupt
       ? `orchestration ledger corrupt: ${ledger.error}`
-      : `orchestration ledger write failed: ${ledger.writeError}`;
+      : ledger.writeError
+        ? `orchestration ledger write failed: ${ledger.writeError}`
+        : `orchestration control unresolved: ${ledger.operationError}`;
     return escalateAction(req, {
       key: "ledger-corrupt",
       title: "Decision orchestrator cannot trust its worker ledger",
@@ -1198,6 +1263,7 @@ async function decideOne(line, evaluateJev, resolveProxyToken) {
       ...mapped,
       diagnostics: {
         engine: "jev-bridge",
+        bridgeVersion: BRIDGE_VERSION,
         model: response.model,
         answers: response.answers,
         usage: response.usage ?? null,
@@ -1212,7 +1278,9 @@ async function decideOne(line, evaluateJev, resolveProxyToken) {
 
 // Boot is guarded so tests can import the pure functions without starting
 // the stdio loop (A0).
-if (process.env.JEV_BRIDGE_NO_BOOT !== "1") {
+if (process.argv.includes("--version")) {
+  process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
+} else if (process.env.JEV_BRIDGE_NO_BOOT !== "1") {
   try {
     const { evaluateJev, resolveProxyToken } = await createJiti(import.meta.url).import(JEV_EXTENSION);
     readStdinLines((line) => void decideOne(line, evaluateJev, resolveProxyToken));
