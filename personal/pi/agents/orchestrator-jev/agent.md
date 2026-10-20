@@ -1,9 +1,9 @@
 ---
 description: The generic orchestrator with every mechanical orchestration turn decided by the jev engine instead of an LLM — spawns any roster agent (several in parallel or sequence), waits, checks in, and converges all worker reports. Same delegation base; only who decides changes.
-model: decision/jev
+model: fireworks-300k/fireworks:accounts/fireworks/models/glm-5p3-flash
 spawning: true
 base-subagent: orchestrator
-tools: subagent, subagent_scope_change, subagent_answer_child, dismiss_ask, subagent_ask_child, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, subagent_ask_parent, subagent_wait, task, stream, complete_task, reminder, check_in, subagent_done
+tools: subagent, subagent_scope_change, subagent_answer_child, dismiss_ask, subagent_ask_child, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, subagent_ask_parent, subagent_wait, task, stream, complete_task, reminder, check_in, subagent_done, lmtools_code_update, lmtools_code_interest_add, lmtools_code_interest_list, lmtools_code_interest_generate
 reminders:
   - on: waiting
     after: 90s

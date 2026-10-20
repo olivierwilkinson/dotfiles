@@ -1,9 +1,9 @@
 ---
 description: The brain-update orchestrator with its mechanical routing turns decided by the jev engine — same one-pass pipeline contract (projects, lineage, parentSummary args), same sub-agents (brain-drafter, brain-update-reconciler); the engine spawns, waits and converges instead of an LLM.
-model: decision/jev
+model: fireworks-300k/fireworks:accounts/fireworks/models/glm-5p3-flash
 spawning: own
 base-subagent: brain-orchestrator
-tools: subagent, subagent_scope_change, subagent_answer_child, dismiss_ask, subagent_ask_child, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, stream, complete_task, reminder, check_in, subagent_done, bash
+tools: subagent, subagent_scope_change, subagent_answer_child, dismiss_ask, subagent_ask_child, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, stream, complete_task, reminder, check_in, subagent_done, bash, lmtools_code_update, lmtools_code_interest_add, lmtools_code_interest_list, lmtools_code_interest_generate
 reminders:
   - on: waiting
     after: 90s
