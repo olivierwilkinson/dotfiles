@@ -28,7 +28,7 @@ import { createJiti } from "@mariozechner/jiti";
 const JEV_EXTENSION =
   "/Users/olivier/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/index.ts";
 // Bump when the extension must distinguish a pinned, older bridge process.
-export const BRIDGE_VERSION = 2;
+export const BRIDGE_VERSION = 3;
 if (process.argv.includes("--version")) {
   process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
   process.exit(0);
@@ -142,9 +142,11 @@ const subagentsPath = process.env.JEV_SUBAGENTS_PATH ?? join(
   homedir(), ".pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents",
 );
 let orchestrationJournal;
+let completionDecisions;
 let sessionMessages;
 try {
   orchestrationJournal = await jiti.import(join(subagentsPath, "orchestration-journal.ts"));
+  completionDecisions = await jiti.import(join(subagentsPath, "completion-decisions.ts"));
   sessionMessages = await jiti.import(join(subagentsPath, "session-messages.ts"));
 } catch (err) {
   fail(`Cannot load shared orchestration modules from JEV_SUBAGENTS_PATH=${subagentsPath}. ` +
@@ -656,7 +658,7 @@ function unconsumedThinker(workers, asks) {
  *  or a terminal NOT-completed report the LLM parent must surface. A
  *  forwarded ask's answer auto-chains to the asking child without waking this
  *  session (the child's subagent_done converges the run). */
-function escalateAction(req, { key, title, body, markerAskId, forwardAskId = null }) {
+function escalateAction(req, { key, title, body, markerAskId, forwardAskId = null, infrastructureIssue = false }) {
   const marker = `escalation_for: ${markerAskId ?? key}`;
   if (req.tools.some((t) => t.name === "escalate")) {
     return {
@@ -665,7 +667,7 @@ function escalateAction(req, { key, title, body, markerAskId, forwardAskId = nul
         {
           tool: "escalate",
           args: {
-            update: true,
+            ...(infrastructureIssue ? {infrastructureIssue: true} : {update: true}),
             key,
             // Inbox caps: title 60, summary 80 (a long askId must not fault the call).
             title: title.slice(0, 60),
@@ -851,6 +853,19 @@ export function goalForState(goal, sessionFile) {
   };
 }
 
+function completionRows(req) {
+  if (req.state?.completionDecisionError) return {error: req.state.completionDecisionError, rows: []};
+  if (req.agent?.sessionFile) {
+    try {
+      if (completionDecisions.completionQuarantinedIds(req.agent.sessionFile).size) return {error: 'Quarantined completion actions require reconciliation', rows: []};
+      const loaded = loadOrchReceipts(req.agent.sessionFile);
+      if (!loaded.ok) return {error: loaded.error, rows: []};
+      return {rows: orchestrationJournal.completionJournalState(loaded.receipts)};
+    } catch (error) { return {error: String(error), rows: []}; }
+  }
+  return {rows: req.state?.completionDecisions ?? []};
+}
+
 export function buildRequest(req) {
   const goal = resolveGoal(req.events);
   const { rows: workers, ledger } = mergedWorkers(req.agent?.sessionFile, req.events, req.capabilities);
@@ -859,6 +874,7 @@ export function buildRequest(req) {
   const doneCalled = doneAlreadyCalled(req.events);
   const agentQuestion = workerAgentQuestion(req);
   const targetQuestion = checkInTargetQuestion(workers);
+  const completion = completionRows(req).rows.find((row) => row.status === 'offered' && completionDecisions.isPendingCompletion(row));
   return {
     model: MODEL,
     state: {
@@ -875,6 +891,7 @@ export function buildRequest(req) {
         .filter((w) => w.spawn_failed)
         .map((w) => ({ name: w.name, agent: w.agent })),
       done_already_reported: doneCalled,
+      completion_decisions: completionRows(req),
       recent_events: digestEvents(req.events),
       run_state: req.state ?? null,
       // A corrupt or unwritable ledger blocks convergence (never a silent
@@ -885,6 +902,8 @@ export function buildRequest(req) {
       ...(ledger.unresolved.length ? { unresolved_operations: ledger.unresolved } : {}),
     },
     questions: {
+      ...(completion ? {completion_decision: {type: 'choice', instructions: 'Choose exactly one offered completion option. Approval authorizes only its admitted sequential actions; human approval is a separate ask action.',
+        criteria: Object.fromEntries(completion.offer.decisions.map((option) => [option.id, option.description]))}} : {}),
       done: {
         type: "noul",
         instructions:
@@ -962,22 +981,6 @@ export function mapAnswers(answers, req) {
   if (doneAlreadyCalled(req.events)) {
     return { terminal: true, say: "Already reported done; ending.", calls: [] };
   }
-  // Mechanical dead-end: repeated failed spawns never resolve by asking the
-  // classifier again (self-spawn blocks, bad agent choices, missing cwd).
-  const failures = trailingSpawnFailures(req.events);
-  if (failures >= 3) {
-    return {
-      terminal: true,
-      say: `${failures} consecutive spawns failed; reporting the failure upward.`,
-      calls: [
-        {
-          tool: "subagent_done",
-          args: { result: spawnFailureReport(req.events, failures) },
-          reason: "mechanical fallback after 3 consecutive spawn failures",
-        },
-      ],
-    };
-  }
   const done = answers.done?.noul ?? 0;
   const next = answers.next_action?.choice ?? "other";
   const agentType =
@@ -1008,12 +1011,47 @@ export function mapAnswers(answers, req) {
       return { say: "Ledger escalation already sent; waiting for reconciliation.", calls: [] };
     }
     return escalateAction(req, {
-      key,
+      key, infrastructureIssue: true,
       title: "Decision orchestrator cannot trust its worker ledger",
       body:
         `${problem}. The run cannot record success on an untrusted ledger — worker lifecycle state cannot be proven, ` +
         `so no convergence or task completion may be recorded. This escalation request needs the user.`,
     });
+  }
+
+  const completions = completionRows(req);
+  if (completions.error) {
+    const key = inboxKey('cd', completions.error);
+    if (escalationSent(req.events, key, receipts)) return {say: 'Completion escalation already sent; waiting for reconciliation.', calls: []};
+    return escalateAction(req, {infrastructureIssue: true, key, title: 'Completion journal unavailable', body: `NOT completed. Reconcile the completion journal: ${completions.error}`});
+  }
+  const pending = completions.rows.find(completionDecisions.isPendingCompletion);
+  if (pending) {
+    if (pending.status !== 'offered') return {say: 'Completion actions/parent answer pending; NOT completed.', calls: []};
+    if (!Object.hasOwn(answers, 'completion_decision')) return {say: 'Completion offer arrived during classification; waiting for its notice.', calls: []};
+    if (!req.tools.some((tool) => tool.name === 'apply_decision')) return escalateAction(req, {key: inboxKey('cd', pending.offer.completionId), title: 'Completion executor unavailable', body: `NOT completed. Reload with apply_decision. Report: ${pending.offer.reportRef}`});
+    const offer = pending.offer;
+    const choice = answers.completion_decision?.choice;
+    const optionId = offer.decisions.some((option) => option.id === choice) ? choice : '__escalate';
+    return {calls: [{tool: 'apply_decision', args: {completionId: offer.completionId, snapshotRevision: offer.snapshotRevision,
+      offerHash: offer.offerHash, reportRef: offer.reportRef, optionId}, reason: 'finite completion option selected'}]};
+  }
+
+  // Mechanical dead-end: repeated failed spawns never resolve by asking the
+  // classifier again (self-spawn blocks, bad agent choices, missing cwd).
+  const failures = trailingSpawnFailures(req.events);
+  if (failures >= 3) {
+    return {
+      terminal: true,
+      say: `${failures} consecutive spawns failed; reporting the failure upward.`,
+      calls: [
+        {
+          tool: "subagent_done",
+          args: { result: spawnFailureReport(req.events, failures) },
+          reason: "mechanical fallback after 3 consecutive spawn failures",
+        },
+      ],
+    };
   }
 
   // E2: route a completed thinker's report — answer the asking child, or
