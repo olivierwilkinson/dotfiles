@@ -13,13 +13,15 @@
 // Exit codes: 0 with a result line on success; non-zero on any fault (the
 // provider's fault/repair loop handles retries).
 //
-// Staleness: a stdio engine process is long-lived per session and pins this
-// bridge's code at its first decision; bridge updates only reach NEW sessions
-// (live sessions keep the pre-update bridge until they end).
+// A process pins this code only until it exits. Engine recovery may respawn
+// from disk under a still-loaded extension, so request capabilities gate
+// completion compatibility.
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline/promises";
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createJiti } from "@mariozechner/jiti";
 
 const JEV_EXTENSION =
@@ -130,141 +132,29 @@ function callArgsById(events) {
  * replay can never overwrite a newer durable kill/interruption. Kill emits no
  * subagent_result — a killed row comes only from the kill tool acknowledgement.
  */
-const LIFECYCLE_STATES = [
-  "spawn_pending", "running", "completed", "failed",
-  "killed", "interrupted", "resumed", "exited-without-done",
-];
-
-const TRANSITIONS = {
-  spawn_pending: ["running", "killed", "exited-without-done", "interrupted", "completed", "failed"],
-  running: ["completed", "failed", "interrupted", "killed", "exited-without-done"],
-  interrupted: ["completed", "failed", "killed", "exited-without-done"],
-  killed: [],
-  completed: [],
-  failed: [],
-  // Resume eligibility: only a child that exited without reporting done may
-  // be resumed (P6 ruling); completed/failed/killed work is never resumed.
-  "exited-without-done": ["completed", "failed", "resumed"],
-  resumed: ["completed", "failed", "interrupted", "killed", "exited-without-done"],
-};
-
-export function canTransition(from, to) {
-  return from === to || TRANSITIONS[from].includes(to);
-}
-
-export function emptyReceipts() {
-  return {
-    v: 1,
-    lifecycle: {},
-    operations: {},
-    consumedCompletions: [],
-    resumeReservations: {},
-    foldedEventCount: 0,
-  };
-}
-
-function applyLifecycle(receipts, childId, state, ts, fields = {}) {
-  const previous = receipts.lifecycle[childId];
-  if (previous && !canTransition(previous.state, state)) return false;
-  // Merge over the previous row: identity (name/agent/taskIds/purpose) and
-  // attempt survive every transition.
-  receipts.lifecycle[childId] = {
-    ...(previous ?? {}),
-    ...Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined)),
-    childId,
-    state,
-    stateTs: ts,
-    attempt: fields.attempt ?? previous?.attempt,
-    purpose: fields.purpose ?? previous?.purpose,
-  };
-  return true;
-}
+const jiti = createJiti(import.meta.url);
+const subagentsPath = process.env.JEV_SUBAGENTS_PATH ?? join(
+  homedir(), ".pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents",
+);
+const { canTransition, emptyReceipts, applyLifecycle, loadOrchReceipts, mergeReceipts,
+  saveOrchReceipts: saveSharedReceipts } = await jiti.import(join(subagentsPath, "orchestration-journal.ts"));
+const { normalizeAcknowledgement } = await jiti.import(join(subagentsPath, "session-messages.ts"));
+export { canTransition, emptyReceipts };
 
 const isRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 
-function mergeReceipts(target, raw) {
-  if (!isRecord(raw)) return { ok: false, error: "unrecognized .orch.json shape" };
-  if (raw.v !== 1) return { ok: false, error: `unknown .orch.json version ${raw.v}` };
-  // Validate the whole ledger before merging anything. Missing collections
-  // are ambiguous state, not evidence that no work or effects exist.
-  if (!isRecord(raw.lifecycle) || !isRecord(raw.operations) || !isRecord(raw.resumeReservations) ||
-      !Array.isArray(raw.consumedCompletions) || raw.consumedCompletions.some((id) => typeof id !== "string") ||
-      !Number.isSafeInteger(raw.foldedEventCount) || raw.foldedEventCount < 0) {
-    return { ok: false, error: "malformed .orch.json collections or event count" };
-  }
-  for (const [childId, row] of Object.entries(raw.lifecycle)) {
-    if (!isRecord(row) || !childId || row.childId !== childId || !LIFECYCLE_STATES.includes(row.state) ||
-        !Number.isFinite(row.stateTs) || row.stateTs < 0) {
-      return { ok: false, error: "malformed .orch.json lifecycle row" };
-    }
-  }
-  for (const operation of Object.values(raw.operations)) {
-    if (!isRecord(operation) || Object.entries(operation).some(([phase, record]) =>
-      !["intent", "acknowledgement", "effect"].includes(phase) || !isRecord(record) || record.phase !== phase)) {
-      return { ok: false, error: "malformed .orch.json operation" };
-    }
-  }
-  for (const reservation of Object.values(raw.resumeReservations)) {
-    if (!isRecord(reservation) || typeof reservation.childId !== "string" || typeof reservation.sessionFile !== "string" ||
-        !Number.isSafeInteger(reservation.attempt) || reservation.attempt < 1 || !Number.isFinite(reservation.reservedAt)) {
-      return { ok: false, error: "malformed .orch.json resume reservation" };
-    }
-  }
-  for (const [childId, row] of Object.entries(raw.lifecycle)) {
-    const existing = target.lifecycle[childId];
-    // A durable terminal state stands: an older spawn row never overwrites it.
-    if (!existing || (row.stateTs >= existing.stateTs && canTransition(existing.state, row.state))) {
-      target.lifecycle[childId] = row;
-    }
-  }
-  for (const [id, operation] of Object.entries(raw.operations)) {
-    target.operations[id] = { ...operation, ...target.operations[id] };
-  }
-  for (const id of raw.consumedCompletions) {
-    if (!target.consumedCompletions.includes(id)) target.consumedCompletions.push(id);
-  }
-  Object.assign(target.resumeReservations, raw.resumeReservations);
-  target.foldedEventCount = Math.max(target.foldedEventCount, raw.foldedEventCount);
-  return { ok: true };
-}
-
-/** Load `<session>.orch.json`; corrupt or unrecognized state is returned as
- *  corrupt so the engine escalates instead of proceeding on an empty ledger. */
 export function readOrchReceipts(sessionFile) {
-  const receipts = emptyReceipts();
-  if (!sessionFile) return { receipts, corrupt: false };
-  let raw;
-  try {
-    raw = readFileSync(`${sessionFile}.orch.json`, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return { receipts, corrupt: false };
-    return { receipts, corrupt: true, error: `.orch.json read failed: ${error?.message ?? error}` };
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (error) {
-    return { receipts, corrupt: true, error: `.orch.json is not parsable: ${error.message}` };
-  }
-  const merged = mergeReceipts(receipts, parsed);
-  return merged.ok ? { receipts, corrupt: false } : { receipts, corrupt: true, error: merged.error };
+  if (!sessionFile) return { receipts: emptyReceipts(), corrupt: false };
+  const loaded = loadOrchReceipts(sessionFile);
+  return loaded.ok ? { receipts: loaded.receipts, corrupt: false }
+    : { receipts: emptyReceipts(), corrupt: true, error: loaded.error };
 }
 
-/** Atomic receipt write: temp + rename, never a partial ledger. */
 export function saveOrchReceipts(sessionFile, receipts) {
-  if (!sessionFile) return { ok: true };
-  const target = `${sessionFile}.orch.json`;
-  const temp = `${target}.tmp`;
-  try {
-    writeFileSync(temp, `${JSON.stringify(receipts, null, 2)}\n`);
-    renameSync(temp, target);
-    return { ok: true };
-  } catch (error) {
-    try {
-      unlinkSync(temp);
-    } catch {}
-    return { error: `receipt write failed: ${error?.message ?? error}` };
-  }
+  // Validate bridge-authored rows with the extension's validator before writing.
+  const validated = mergeReceipts(emptyReceipts(), receipts);
+  if (!validated.ok) return { error: validated.error };
+  return sessionFile ? saveSharedReceipts(sessionFile, receipts) : { ok: true };
 }
 
 /** Legacy `<session>.workers.json` rows fold in as attempt-1 spawn rows; new
@@ -275,7 +165,9 @@ export function migrateLegacyWorkers(receipts, legacyRows) {
     if (!row || typeof row !== "object" || typeof row.name !== "string") continue;
     const childId = typeof row.child_id === "string" && row.child_id ? row.child_id : `legacy:${row.name}`;
     if (receipts.lifecycle[childId]) continue;
-    const state = row.completed ? "completed" : row.spawn_failed ? "spawn_pending" : row.child_id ? "running" : "spawn_pending";
+    const state = row.completed
+      ? row.verdict === "done" ? "completed" : ["failed", "failure", "error"].includes(row.verdict) ? "failed" : "exited-without-done"
+      : row.spawn_failed ? "spawn_pending" : row.child_id ? "running" : "spawn_pending";
     receipts.lifecycle[childId] = {
       childId,
       name: row.name,
@@ -299,32 +191,42 @@ function purposeOfCall(call) {
   return thinkerFor ? "think" : "work";
 }
 
-// Mirror the shared acknowledgement contract for direct/legacy bridge callers
-// too: structured refusals and infrastructure failures override display text.
 function acknowledged(event) {
-  const details = isRecord(event.details) ? event.details : {};
-  return !event.isError && event.acknowledgement?.successful !== false &&
-    !["error", "blocked", "schemaViolated", "schemaFailure", "schemaError", "refused", "aborted",
-      "infraIssue", "receiptError", "corrupt"].some((key) => details[key]) &&
-    details.success !== false && details.ok !== false &&
-    !["blocked", "refused", "schema_failure", "schema_failed", "error"].includes(details.status) &&
-    !details.handoff?.schemaViolated && !(Array.isArray(details.schemaErrors) && details.schemaErrors.length > 0);
+  return (event.acknowledgement ?? normalizeAcknowledgement(event)).successful;
 }
 
 /**
- * Fold transcript events onto the receipts. Events only ADD: each index folds
- * once (`foldedEventCount` guards replay after reload), and lifecycle moves
- * through the guarded state machine — a replayed spawn ack cannot regress a
- * durable kill/interruption, and a completion after a kill is a phantom.
+ * Re-fold the sliding transcript window on every pass. Operation ids and
+ * stable completion ids deduplicate effects; lifecycle guards prevent an old
+ * spawn acknowledgement from regressing a newer terminal state.
  */
-export function foldEvents(receipts, events) {
+export function foldEvents(receipts, events, capabilities) {
   let changed = false;
-  const start = receipts.foldedEventCount;
+  if (capabilities?.completionKind && receipts.operations["protocol:completion-kind"]) {
+    delete receipts.operations["protocol:completion-kind"];
+    changed = true;
+  }
   const calls = callArgsById(events);
-  for (let i = start; i < events.length; i++) {
-    const e = events[i];
+  for (const e of events) {
     if (e.type === "decision" && Array.isArray(e.calls)) {
       for (const c of e.calls) {
+        const escalationKey = c?.tool === "escalate" ? c.args?.key
+          : /escalation_for: ([^\s)]+)/.exec(String(c?.args?.question ?? c?.args?.result ?? ""))?.[1]?.replace(/:$/, "");
+        if (escalationKey) {
+          const operationId = `escalation:${escalationKey}`;
+          if (!receipts.operations[operationId]) {
+            receipts.operations[operationId] = { intent: { phase: "intent", tool: c.tool, callId: c.id } };
+            changed = true;
+          }
+        }
+        if (["subagent_kill", "subagent_interrupt", "subagent_resume"].includes(c?.tool)) {
+          const operationId = c.args?.operationId ?? `control:${c.id}`;
+          const operation = receipts.operations[operationId] ??= {};
+          if (!operation.intent) {
+            operation.intent = { phase: "intent", tool: c.tool, callId: c.id, childId: c.args?.id ?? c.args?.subagentId, detail: { args: c.args } };
+            changed = true;
+          }
+        }
         if (c?.tool !== "subagent") continue;
         const operationId = `spawn:${c.id}`;
         if (receipts.operations[operationId]?.intent) continue;
@@ -337,9 +239,14 @@ export function foldEvents(receipts, events) {
           agent: c.args?.agent ?? null,
           purpose: purposeOfCall(c),
           attempt: 1,
-          taskIds: Array.isArray(c.args?.tasks) ? c.args.tasks : undefined,
+          taskIds: Array.isArray(c.args?.tasks) && c.args.tasks.every(Number.isInteger) ? c.args.tasks : undefined,
           askId: /thinker_for: (\S+)/.exec(String(c.args?.task ?? ""))?.[1],
         });
+        if (c.args?.tasks !== undefined && (!Array.isArray(c.args.tasks) || !c.args.tasks.every(Number.isInteger))) {
+          Object.assign(receipts.operations[operationId].intent, {
+            infraIssue: true, error: "spawn taskIds must be integers",
+          });
+        }
         changed = true;
       }
     } else if (e.type === "tool_result" && e.tool === "subagent") {
@@ -359,23 +266,26 @@ export function foldEvents(receipts, events) {
       if (typeof childId === "string" && childId && row) {
         // Never replace an existing stable row with the pending spawn row:
         // an old acknowledgement cannot resurrect a killed/interrupted child.
-        applyLifecycle(receipts, childId, "running", Date.now(), receipts.lifecycle[childId] ? {} : row);
+        applyLifecycle(receipts, childId, "running", Date.now(), receipts.lifecycle[childId] ? {} : {
+          ...row, sessionFile: e.details?.sessionFile,
+        });
         if (key !== childId) delete receipts.lifecycle[key];
         receipts.operations[operationId].acknowledgement.childId = childId;
       }
     } else if (e.type === "tool_result" && ["subagent_kill", "subagent_interrupt", "subagent_resume"].includes(e.tool)) {
-      // The control call's args (intent, matched by callId) name the target.
-      const args = calls.get(e.callId)?.args ?? {};
-      const details = isRecord(e.details) ? e.details : {};
-      const operationId = args.operationId ?? `control:${e.callId}`;
+      const call = calls.get(e.callId);
+      const operationId = call?.args?.operationId ?? Object.entries(receipts.operations)
+        .find(([, row]) => row.intent?.callId === e.callId && row.intent.tool === e.tool)?.[0] ?? `control:${e.callId}`;
       const operation = receipts.operations[operationId] ??= {};
-      // The event cursor is only an optimization: durable per-call effects
-      // also guard duplicate acknowledgements at different transcript indexes.
+      const args = call?.args ?? operation.intent?.detail?.args ?? {};
+      const details = isRecord(e.details) ? e.details : {};
       if (operation.effect || operation.acknowledgement) continue;
       operation.intent ??= { phase: "intent", tool: e.tool, callId: e.callId };
       const successful = acknowledged(e);
       operation.acknowledgement = {
         phase: "acknowledgement", isError: !successful, status: details.status,
+        childId: args.id ?? args.subagentId ?? operation.intent.childId ?? details.id ?? details.childId,
+        ts: e.ts ?? Date.now(),
         ...(details.infraIssue || details.receiptError || details.corrupt
           ? { infraIssue: true, error: String(details.receiptError ?? details.error ?? "control acknowledgement reported infrastructure failure") }
           : {}),
@@ -397,15 +307,14 @@ export function foldEvents(receipts, events) {
       }
       const rows = Object.values(receipts.lifecycle);
       const byId = args.id ?? args.subagentId ?? (e.tool !== "subagent_resume" ? details.id ?? details.childId : undefined);
-      const candidates = byId
-        ? rows.filter((r) => r.childId === byId)
-        : e.tool === "subagent_resume" && args.sessionPath
-          ? rows.filter((r) => r.sessionFile === args.sessionPath)
+      const candidates = e.tool === "subagent_resume" && args.sessionPath
+        ? rows.filter((r) => r.sessionFile === args.sessionPath && !r.resumedBy)
+        : byId ? rows.filter((r) => r.childId === byId)
           : rows.filter((r) => r.name === args.name);
       // A resume with only a session path falls back to the single
       // exited-without-done row — the only resume-eligible state.
       const resolved = candidates.length === 1 ? candidates : candidates.length === 0 && e.tool === "subagent_resume"
-        ? rows.filter((r) => r.state === "exited-without-done")
+        ? rows.filter((r) => r.state === "exited-without-done" && !r.resumedBy)
         : candidates;
       const row = resolved.length === 1 ? resolved[0] : undefined;
       if (!row) {
@@ -413,25 +322,38 @@ export function foldEvents(receipts, events) {
         operation.acknowledgement.error = `${e.tool} acknowledgement has no unambiguous lifecycle target`;
         continue;
       }
-      // Claim before applying either half of a resumed attempt. A replay is
-      // an idempotent no-op even when a terminal row rejects the transition.
-      operation.effect = { phase: "effect", tool: e.tool, childId: row.childId, state };
-      if (!applyLifecycle(receipts, row.childId, state, Date.now(),
-        state === "exited-without-done" ? { resumeEligible: details.resumeEligible === true, completionKind: state } : {})) continue;
+      operation.acknowledgement.childId = row.childId;
       if (e.tool === "subagent_resume") {
-        // The resumed attempt is a NEW child on the old session chain. An
-        // existing newer/terminal row must not be replaced by this old ack.
         const newChildId = details.id ?? /Id:\s*([0-9a-f-]{6,})/i.exec(String(e.output ?? ""))?.[1];
-        if (typeof newChildId === "string" && newChildId && newChildId !== row.childId && !receipts.lifecycle[newChildId]) {
+        if (row.state !== "exited-without-done" || typeof newChildId !== "string" || !newChildId || newChildId === row.childId) {
+          operation.acknowledgement.infraIssue = true;
+          operation.acknowledgement.error = "resume acknowledgement lacks an eligible old row or a new child id";
+          continue;
+        }
+        if (!receipts.lifecycle[newChildId]) {
           applyLifecycle(receipts, newChildId, "resumed", Date.now(), {
-            ...row,
-            attempt: (row.attempt ?? 1) + 1,
-            resumedFrom: args.sessionPath ?? row.sessionFile ?? null,
+            name: details.name ?? row.name, agent: row.agent, purpose: row.purpose,
+            taskIds: row.taskIds, askId: row.askId,
+            sessionFile: details.sessionFile ?? args.sessionPath ?? row.sessionFile,
+            attempt: (row.attempt ?? 1) + 1, resumedFrom: row.childId,
           });
         }
+        row.resumedBy = newChildId;
+      } else {
+        applyLifecycle(receipts, row.childId, state, Date.now(), state === "exited-without-done"
+          ? { resumeEligible: details.resumeEligible === true, completionKind: state } : {});
       }
+      operation.effect = { phase: "effect", tool: e.tool, childId: row.childId, state, ts: e.ts ?? Date.now() };
     } else if (e.type === "notification" && e.kind === "subagent_result") {
       const payload = e.payload ?? {};
+      if (!capabilities?.completionKind && !payload.completionKind) {
+        receipts.operations["protocol:completion-kind"] ??= { acknowledgement: {
+          phase: "acknowledgement", infraIssue: true,
+          error: "completionKind capability missing: reload the extension before running this bridge",
+        } };
+        changed = true;
+        continue;
+      }
       const rows = Object.values(receipts.lifecycle);
       const childId = String(payload.id ?? payload.childId ?? "");
       const row = childId
@@ -441,19 +363,19 @@ export function foldEvents(receipts, events) {
           : [];
       const target = Array.isArray(row) ? (row.length === 1 ? row[0] : undefined) : row;
       if (!target) continue;
-      const completionId = `${target.childId}:${payload.resultStorePath ?? e.ts ?? i}`;
+      const completionId = `${target.childId}:${payload.resultStorePath ?? e.message?.eventId ?? e.eventId}`;
       if (receipts.consumedCompletions.includes(completionId)) continue;
       receipts.consumedCompletions.push(completionId);
       // Explicit completionKind from the parent's watcher/.exit facts. Legacy
       // notices without one are never task success: an unknown clean exit
       // folds as exited-without-done, never "completed".
-      const kind = payload.completionKind
-        ?? (payload.interrupted ? "interrupted"
-          : payload.lost ? "exited-without-done"
-            : (payload.exitCode ?? 0) !== 0 || payload.errorMessage ? "failed" : "exited-without-done");
+      const reportedKind = payload.completionKind
+        ?? ((payload.exitCode ?? 0) !== 0 || payload.errorMessage || payload.error ? "failed" : "exited-without-done");
+      const kind = ["completed", "failed"].includes(reportedKind) ? reportedKind : "exited-without-done";
       applyLifecycle(receipts, target.childId, kind, Date.now(), {
-        completionKind: kind,
+        completionKind: kind, resumeEligible: kind === "exited-without-done",
         ...(payload.resultStorePath ? { resultStorePath: payload.resultStorePath } : {}),
+        ...(payload.sessionFile ? { sessionFile: payload.sessionFile } : {}),
       });
       // The store holds the full report; the notice text is the fallback.
       let report = String(e.text ?? "");
@@ -466,11 +388,14 @@ export function foldEvents(receipts, events) {
       }
       receipts.lifecycle[target.childId].report = report.slice(0, 4000);
       changed = true;
+    } else if (e.type === "tool_result") {
+      const operation = Object.entries(receipts.operations).find(([key, row]) =>
+        key.startsWith("escalation:") && row.intent?.callId === e.callId)?.[1];
+      if (operation && !operation.acknowledgement) {
+        operation.acknowledgement = { phase: "acknowledgement", isError: !acknowledged(e) };
+        changed = true;
+      }
     }
-  }
-  if (events.length > receipts.foldedEventCount) {
-    receipts.foldedEventCount = events.length;
-    changed = true;
   }
   return changed;
 }
@@ -481,12 +406,12 @@ export function foldEvents(receipts, events) {
  * ledgers surface as flags — the engine must escalate, never converge on an
  * empty ledger.
  */
-export function mergedWorkers(sessionFile, events) {
+export function mergedWorkers(sessionFile, events, capabilities) {
   const loaded = readOrchReceipts(sessionFile);
   const receipts = loaded.receipts;
-  const ledger = { corrupt: loaded.corrupt === true, error: loaded.error, writeError: null, operationError: null };
-  if (loaded.corrupt) return { rows: workerRows(receipts), ledger };
-  if (!receipts.foldedEventCount) {
+  const ledger = { corrupt: loaded.corrupt === true, error: loaded.error, writeError: null, operationError: null, unresolved: [] };
+  if (loaded.corrupt) return { rows: workerRows(receipts), ledger, receipts };
+  if (Object.keys(receipts.lifecycle).length === 0) {
     try {
       const rows = JSON.parse(readFileSync(`${sessionFile}.workers.json`, "utf8"));
       migrateLegacyWorkers(receipts, rows);
@@ -494,14 +419,31 @@ export function mergedWorkers(sessionFile, events) {
       // No legacy ledger — a fresh one starts here.
     }
   }
-  foldEvents(receipts, events);
-  const unresolved = Object.entries(receipts.operations).find(([, operation]) => operation.acknowledgement?.infraIssue);
-  if (unresolved) ledger.operationError = `${unresolved[0]}: ${unresolved[1].acknowledgement.error}`;
+  foldEvents(receipts, events, capabilities);
+  const operations = Object.entries(receipts.operations);
+  const unresolved = operations.find(([, operation], index) => {
+    const ack = operation.acknowledgement?.infraIssue ? operation.acknowledgement : operation.intent;
+    if (!ack?.infraIssue) return false;
+    const childId = ack.childId ?? operation.intent?.childId;
+    // Keep the failed receipt for audit, but a later acknowledged effect on
+    // this same child reconciles the transient failure, even after reload.
+    return !childId || !operations.some(([, later], laterIndex) => {
+      const effect = later.effect;
+      return effect?.childId === childId && later.acknowledgement &&
+        !later.acknowledgement.isError && !later.acknowledgement.infraIssue &&
+        ((effect.ts ?? 0) > (ack.ts ?? 0) || ((effect.ts ?? 0) === (ack.ts ?? 0) && laterIndex > index));
+    });
+  });
+  if (unresolved) ledger.operationError = `${unresolved[0]}: ${unresolved[1].acknowledgement?.error ?? unresolved[1].intent?.error}`;
+  ledger.unresolved = operations.filter(([, operation]) => operation.intent && !operation.acknowledgement && !operation.effect)
+    .map(([id]) => id);
+  ledger.unresolved.push(...Object.values(receipts.lifecycle)
+    .filter((row) => row.state === "spawn_pending" && !row.spawnFailed).map((row) => row.childId));
   if (sessionFile) {
     const saved = saveOrchReceipts(sessionFile, receipts);
     if (saved.error) ledger.writeError = saved.error;
   }
-  return { rows: workerRows(receipts), ledger };
+  return { rows: workerRows(receipts), ledger, receipts };
 }
 
 /** The worker view over a lifecycle row: booleans the engine reasons with,
@@ -531,6 +473,7 @@ function workerRows(receipts) {
     task_ids: row.taskIds ?? [],
     resume_eligible: row.resumeEligible === true,
     resumed_from: row.resumedFrom ?? null,
+    resumed_by: row.resumedBy ?? null,
     completion_kind: row.completionKind ?? null,
     verdict: row.state === "completed" ? "done" : null,
     report,
@@ -568,6 +511,8 @@ export function budgetWorkerRows(workers) {
       task_ids: w.task_ids,
       resume_eligible: w.resume_eligible,
       resumed_from: w.resumed_from,
+      resumed_by: w.resumed_by,
+      session_file: w.session_file,
       completion_kind: w.completion_kind,
       running: w.running,
       spawn_failed: w.spawn_failed,
@@ -637,9 +582,12 @@ function thinkerDispatched(events, askId) {
   return dispatchedWithMarker(events, "subagent", `thinker_for: ${askId}`);
 }
 
-function escalationSent(events, askId) {
+function escalationSent(events, askId, receipts) {
   return (
+    Boolean(receipts?.operations[`escalation:${askId}`]) ||
     dispatchedWithMarker(events, "subagent_ask_parent", `escalation_for: ${askId}`) ||
+    events.some((e) => e.type === "decision" && e.calls?.some((c) =>
+      c?.tool === "subagent_done" && String(c.args?.result ?? "").includes(`escalation_for: ${askId}`))) ||
     events.some(
       (e) =>
         e.type === "decision" &&
@@ -670,10 +618,10 @@ export function parseThinkerReport(report) {
   return null;
 }
 
-/** E2: the first completed thinker worker whose target ask is still pending. */
+/** E2: a terminal thinker whose target ask is still pending. */
 function unconsumedThinker(workers, asks) {
   for (const w of workers) {
-    if (w.purpose !== "think" || !w.completed || !w.report || !w.askId) continue;
+    if (w.purpose !== "think" || w.running || (w.state === "spawn_pending" && !w.spawn_failed) || !w.askId) continue;
     const ask = asks.find((a) => a.askId === w.askId);
     if (ask) return { worker: w, ask };
   }
@@ -685,7 +633,7 @@ function unconsumedThinker(workers, asks) {
  *  forwarded ask's answer auto-chains to the asking child without waking this
  *  session (the child's subagent_done converges the run). */
 function escalateAction(req, { key, title, body, markerAskId, forwardAskId = null }) {
-  const marker = markerAskId ? `escalation_for: ${markerAskId}` : null;
+  const marker = `escalation_for: ${markerAskId ?? key}`;
   if (req.tools.some((t) => t.name === "escalate")) {
     return {
       say: `Escalating to the user's Inbox: ${title}`,
@@ -732,8 +680,8 @@ function escalateAction(req, { key, title, body, markerAskId, forwardAskId = nul
           result:
             `ESCALATION REQUEST${marker ? ` (${marker})` : ""}: ${title}\n\n` +
             `Goal was NOT completed — this is an escalation request needing the user, not a completion report.\n\n` +
-            `While the orchestration ledger is corrupt or unwritable, this subagent_done call will be REFUSED by the extension ` +
-            `(fail closed); no completion can be recorded.\n\n${body}`,
+            (key === "ledger-corrupt" ? `While the orchestration ledger is corrupt or unwritable, this subagent_done call will be REFUSED by the extension ` +
+              `(fail closed); no completion can be recorded.\n\n` : "") + body,
         },
         reason: "no escalate/ask_parent capability; terminal escalation report",
       },
@@ -881,7 +829,7 @@ export function goalForState(goal, sessionFile) {
 
 export function buildRequest(req) {
   const goal = resolveGoal(req.events);
-  const { rows: workers, ledger } = mergedWorkers(req.agent?.sessionFile, req.events);
+  const { rows: workers, ledger } = mergedWorkers(req.agent?.sessionFile, req.events, req.capabilities);
   const asks = pendingAsks(req.events);
   const carriers = goalForState(goal, req.agent?.sessionFile);
   const doneCalled = doneAlreadyCalled(req.events);
@@ -910,6 +858,7 @@ export function buildRequest(req) {
       ...(ledger.corrupt ? { ledger_corrupt: true, ledger_error: ledger.error } : {}),
       ...(!ledger.corrupt && ledger.writeError ? { ledger_write_error: ledger.writeError } : {}),
       ...(ledger.operationError ? { ledger_operation_error: ledger.operationError } : {}),
+      ...(ledger.unresolved.length ? { unresolved_operations: ledger.unresolved } : {}),
     },
     questions: {
       done: {
@@ -947,7 +896,7 @@ export function buildRequest(req) {
 export function convergeReport(workers, done, next) {
   const completed = workers.filter((w) => w.completed && w.report);
   if (completed.length === 0) {
-    return `No worker reports were received (jev: done=${done.toFixed(2)}, next=${next}).`;
+    return `Goal was NOT completed: no worker reports were received (jev: done=${done.toFixed(2)}, next=${next}).`;
   }
   return completed
     .map(
@@ -956,6 +905,13 @@ export function convergeReport(workers, done, next) {
     )
     .join("\n\n---\n\n")
     .slice(0, 4000);
+}
+
+function completedResume(workers, worker, seen = new Set()) {
+  if (!worker.resumed_by || seen.has(worker.child_id)) return false;
+  seen.add(worker.child_id);
+  const next = workers.find((w) => w.child_id === worker.resumed_by && w.resumed_from === worker.child_id);
+  return Boolean(next && (next.completed || completedResume(workers, next, seen)));
 }
 
 /** E1: the budgeted decision state as text — the same picture jev sees. */
@@ -1005,7 +961,7 @@ export function mapAnswers(answers, req) {
       ? answers.worker_agent.choice
       : "worker";
   const goal = resolveGoal(req.events);
-  const { rows: workers, ledger } = mergedWorkers(req.agent?.sessionFile, req.events);
+  const { rows: workers, ledger, receipts } = mergedWorkers(req.agent?.sessionFile, req.events, req.capabilities);
   const asks = pendingAsks(req.events);
   const blockers = workers.filter((w) => w.spawn_failed);
   // Leaf sessions (PI_DENY_TOOLS) have no spawn tools; emitting them faults every repair attempt.
@@ -1015,13 +971,18 @@ export function mapAnswers(answers, req) {
   // Corrupt or unwritable ledger: convergence may never succeed on an
   // unfaithful picture — stop and infra-escalate instead.
   if (ledger.corrupt || ledger.writeError || ledger.operationError) {
+    const key = ledger.corrupt || ledger.writeError ? "ledger-corrupt"
+      : ledger.operationError.startsWith("protocol:") ? "protocol-completion-kind" : "ledger-operation";
+    if (escalationSent(req.events, key, receipts)) {
+      return { say: "Ledger escalation already sent; waiting for reconciliation.", calls: [] };
+    }
     const problem = ledger.corrupt
       ? `orchestration ledger corrupt: ${ledger.error}`
       : ledger.writeError
         ? `orchestration ledger write failed: ${ledger.writeError}`
         : `orchestration control unresolved: ${ledger.operationError}`;
     return escalateAction(req, {
-      key: "ledger-corrupt",
+      key,
       title: "Decision orchestrator cannot trust its worker ledger",
       body:
         `${problem}. The run cannot record success on an untrusted ledger — worker lifecycle state cannot be proven, ` +
@@ -1033,7 +994,7 @@ export function mapAnswers(answers, req) {
   // escalate its finding upward (unparsable is an escalation, never a re-think).
   const thinker = unconsumedThinker(workers, asks);
   if (thinker) {
-    const parsed = parseThinkerReport(thinker.worker.report);
+    const parsed = thinker.worker.completed ? parseThinkerReport(thinker.worker.report) : null;
     if (parsed?.kind === "response" && canAnswerChild) {
       return {
         say: `Answering ${thinker.ask.from} on ask ${thinker.ask.askId} with the thinker's response.`,
@@ -1046,13 +1007,15 @@ export function mapAnswers(answers, req) {
         ],
       };
     }
-    if (escalationSent(req.events, thinker.ask.askId)) {
+    if (escalationSent(req.events, thinker.ask.askId, receipts)) {
       return { say: "Thinker escalation already sent; waiting for the user.", calls: [] };
     }
     const finding =
-      parsed?.kind === "escalation_request"
-        ? parsed.text
-        : `The thinker's report was unparsable and needs the user's judgement. Raw report (first 1500 chars):\n${String(thinker.worker.report).slice(0, 1500)}`;
+      !thinker.worker.completed
+        ? `The thinker ended in state ${thinker.worker.state} without completing the ask. Reconcile or choose a new attempt; no automatic re-think will be dispatched.`
+        : parsed?.kind === "escalation_request"
+          ? parsed.text
+          : `The thinker's report was unparsable and needs the user's judgement. Raw report (first 1500 chars):\n${String(thinker.worker.report).slice(0, 1500)}`;
     return escalateAction(req, {
       key: thinker.ask.askId,
       title: `Pending child ask ${thinker.ask.askId} from "${thinker.ask.from}" needs the user`,
@@ -1068,7 +1031,7 @@ export function mapAnswers(answers, req) {
   // when this session cannot spawn (leaf jev session).
   if (asks.length > 0 && canSpawn) {
     const ask = asks[0];
-    if (thinkerDispatched(req.events, ask.askId)) {
+    if (thinkerDispatched(req.events, ask.askId) || workers.some((w) => w.purpose === "think" && w.askId === ask.askId)) {
       return { say: "Thinker already dispatched; waiting for its report.", calls: [] };
     }
     const name = `thinker-${ask.askId}`;
@@ -1103,7 +1066,7 @@ export function mapAnswers(answers, req) {
   if (next === "escalate" && (asks.length > 0 || blockers.length > 0)) {
     const ask = asks[0];
     // One escalation per ask: a re-chosen escalate idles until answered.
-    if (ask && escalationSent(req.events, ask.askId)) {
+    if (ask && escalationSent(req.events, ask.askId, receipts)) {
       return { say: "Escalation already sent; waiting for the answer.", calls: [] };
     }
     return escalateAction(req, {
@@ -1117,6 +1080,10 @@ export function mapAnswers(answers, req) {
       // remaining asks stay pending locally.
       forwardAskId: ask?.askId ?? null,
     });
+  }
+
+  if ((done >= 0.5 || next === "report_done") && ledger.unresolved.length) {
+    return { say: `Holding: unresolved operations ${ledger.unresolved.join(", ")} need reconciliation.`, calls: [] };
   }
 
   // A4: a zero-worker turn must never exit as done while spawning is possible —
@@ -1149,7 +1116,21 @@ export function mapAnswers(answers, req) {
         calls: [],
       };
     }
-    // Converge: the report the parent receives is every worker's report, not a stub.
+    const incomplete = workers.filter((w) => ["exited-without-done", "failed"].includes(w.state) &&
+      !completedResume(workers, w));
+    if (incomplete.length || !workers.some((w) => w.completed && w.report)) {
+      const key = "workers-incomplete";
+      if (escalationSent(req.events, key, receipts)) {
+        return { say: "Incomplete-worker escalation already sent; waiting for reconciliation.", calls: [] };
+      }
+      return escalateAction(req, {
+        key, title: "Worker outcomes do not establish goal completion",
+        body: incomplete.length
+          ? `Goal was NOT completed. Reconcile or recover these workers: ${incomplete.map((w) => `${w.child_id} (${w.state})`).join(", ")}. Any authorized resume is capped at three attempts per session chain.`
+          : "Goal was NOT completed: no completed worker reports were received.",
+      });
+    }
+    // Converge: the report the parent receives is every completed worker's report.
     return {
       terminal: true,
       say: `Goal complete: ${goal.slice(0, 200)}`,
@@ -1285,7 +1266,7 @@ if (process.argv.includes("--version")) {
   process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
 } else if (process.env.JEV_BRIDGE_NO_BOOT !== "1") {
   try {
-    const { evaluateJev, resolveProxyToken } = await createJiti(import.meta.url).import(JEV_EXTENSION);
+    const { evaluateJev, resolveProxyToken } = await jiti.import(JEV_EXTENSION);
     readStdinLines((line) => void decideOne(line, evaluateJev, resolveProxyToken));
   } catch (err) {
     fail(err?.stack || String(err));
