@@ -10,7 +10,7 @@ return {
     auto_start = false,
     terminal_cmd = "devx claude",
     terminal = {
-      provider = require("olivier.terminal.tmux"),
+      provider = vim.env.TMUX and require("olivier.terminal.tmux") or "auto", -- fall back silently outside tmux
       provider_opts = {
         split_direction = "vertical", -- "vertical" (side by side) or "horizontal" (stacked)
         size = 40, -- percentage of screen
