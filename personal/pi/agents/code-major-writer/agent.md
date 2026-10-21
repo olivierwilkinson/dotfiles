@@ -1,5 +1,4 @@
 ---
-model: decision/jev
 thinkingLevel: medium
 system-prompt: append
 ---
