@@ -17,18 +17,18 @@
 // from disk under a still-loaded extension, so request capabilities gate
 // completion compatibility.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { createJiti } from "@mariozechner/jiti";
 
 const JEV_EXTENSION =
   "/Users/olivier/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/index.ts";
 // Bump when the extension must distinguish a pinned, older bridge process.
-export const BRIDGE_VERSION = 6;
+export const BRIDGE_VERSION = 7;
 if (process.argv.includes("--version")) {
   process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
   process.exit(0);
@@ -146,12 +146,18 @@ let completionDecisions;
 let sessionMessages;
 let statusReconciliation;
 let recovery;
+let convergenceContracts;
+let convergence;
+let inbox;
 try {
   orchestrationJournal = await jiti.import(join(subagentsPath, "orchestration-journal.ts"));
   completionDecisions = await jiti.import(join(subagentsPath, "completion-decisions.ts"));
   sessionMessages = await jiti.import(join(subagentsPath, "session-messages.ts"));
   statusReconciliation = await jiti.import(join(subagentsPath, "status-reconciliation.ts"));
   recovery = await jiti.import(join(subagentsPath, "recovery.ts"));
+  convergenceContracts = await jiti.import(join(subagentsPath, "convergence-contracts.ts"));
+  convergence = await jiti.import(join(subagentsPath, "convergence.ts"));
+  inbox = await jiti.import(join(subagentsPath, "inbox.ts"));
 } catch (err) {
   fail(`Cannot load shared orchestration modules from JEV_SUBAGENTS_PATH=${subagentsPath}. ` +
     `Update the installed subagents extension and reload sessions before activating this bridge, ` +
@@ -222,6 +228,8 @@ function purposeOfCall(call) {
   if (call?.tool !== "subagent") return undefined;
   const slot = call.args?.spawnSlot ?? call.spawn?.slot;
   if (slot?.startsWith("status-scout:")) return "status_scout";
+  if (slot?.startsWith("verification:") || slot?.startsWith("goal_status:")) return "verification_scout";
+  if (slot?.startsWith("synthesis:")) return "synthesis";
   if (slot?.startsWith("task:")) return "work";
   if (slot?.startsWith("think:") || legacyThinkerAskId(call)) return "think";
   return call.args?.purpose ?? "work";
@@ -1183,7 +1191,7 @@ export function taskDispatchCall(req, task, agentType, reason, context, exceptOp
     calls: [{tool: "subagent", args: {agent: agentType, purpose: "work"}, spawn: {slot: `task:${task.id}`}, reason}]};
 }
 
-export function buildRequest(req) {
+export function buildRequestCore(req) {
   const goal = resolveGoal(req.events);
   const { rows: workers, ledger, receipts } = mergedWorkers(req.agent?.sessionFile, req.events, req.capabilities);
   const asks = pendingAsks(req.events);
@@ -1277,7 +1285,13 @@ export function buildRequest(req) {
   };
 }
 
-/** One converged result from every completed worker's report. */
+/**
+ * One converged result from every completed worker's report.
+ * @deprecated P7 replaced terminal convergence with the shared convergence
+ * state machine; this legacy concat-and-slice path survives only for the v6
+ * compatibility sessions (pre-P7 offline fixtures) and must never be reached
+ * on a P7 success path (spec §5).
+ */
 export function convergeReport(workers, done, next) {
   const completed = workers.filter((w) => w.completed && w.report);
   if (completed.length === 0) {
@@ -1318,7 +1332,7 @@ function decisionStateText(req, goal, workers) {
   return `Goal:\n${carriers.goal}\n\nWorkers:\n${workerLines.join("\n") || "(none)"}`;
 }
 
-export function mapAnswers(answers, req) {
+export function mapAnswersCore(answers, req, p7 = {active: false}) {
   // The report was already delivered — never call subagent_done twice.
   if (doneAlreadyCalled(req.events)) {
     return { terminal: true, say: "Already reported done; ending.", calls: [] };
@@ -1728,7 +1742,14 @@ export function mapAnswers(answers, req) {
   if (decisionHold && (done >= 0.5 || ["report_done", "spawn_worker"].includes(next))) return {say: "Holding: decision reconciliation pending.", calls: []};
 
   if ((done >= 0.5 || next === "report_done") && ledger.unresolved.length) {
-    const unresolved = [...new Set(ledger.unresolved)].sort();
+    // P7: a reserved/awaiting-ack convergence arm is tracked by the convergence
+    // journal ('wait'), not by this v6 unresolved-operations escalation.
+    const armPending = (id) => {
+      const row = receipts.lifecycle[id] ?? receipts.lifecycle[receipts.operations[id]?.intent?.childKey];
+      return Boolean(p7.active && row && ARM_SLOT.test(row.spawnSlot ?? ""));
+    };
+    const unresolved = [...new Set(ledger.unresolved)].filter((id) => !armPending(id)).sort();
+    if (unresolved.length) {
     const hold = { say: `Holding: unresolved operations ${unresolved.join(", ")} need reconciliation.`, calls: [] };
     // The provider commits terminal state BEFORE executing the tool call, so
     // escalateAction's refused-subagent_done fallback would latch the engine
@@ -1743,11 +1764,14 @@ export function mapAnswers(answers, req) {
       key, title: "Orchestration operations need reconciliation",
       body: `Goal completion is blocked by unresolved operations: ${unresolved.join(", ")}. Reconcile their outcomes before proceeding.`,
     });
+    }
   }
 
   // A4: a zero-worker turn must never exit as done while spawning is possible —
   // truncation can hide the real state, so verify mechanically instead.
+  // P7 replaces the verify+repair worker with an independent convergence arm.
   if ((done >= 0.5 || next === "report_done") && workers.length === 0 && canSpawn) {
+    if (p7.active) return p7HeldConvergence(req, answers, p7);
     const tree = taskTreeOf(req);
     const eligibleTask = tree.available && tree.ok ? tree.tree.tasks.find((task) => dispatchEligible(req, task, workers, receipts)) : undefined;
     if (eligibleTask) return taskDispatchCall(req, eligibleTask, agentType, "task-driven zero-worker guard", {rows: workers, receipts});
@@ -1774,6 +1798,9 @@ export function mapAnswers(answers, req) {
   }
 
   if (done >= 0.5 || next === "report_done") {
+    // P7: terminal convergence belongs to the convergence state machine —
+    // a classifier verdict can never authorize successful done (spec §5).
+    if (p7.active) return p7HeldConvergence(req, answers, p7);
     // No successful convergence with unresolved operations: a live child
     // (running, interrupted-but-live, or resumed) blocks the done report.
     const live = workers.filter((w) => w.running);
@@ -1973,4 +2000,836 @@ if (process.env.JEV_BRIDGE_NO_BOOT !== "1") {
   } catch (err) {
     fail(err?.stack || String(err));
   }
+}
+
+// ─── P7 convergence (bridge side) ────────────────────────────────────────────
+//
+// Shared state machine: convergence.ts owns the durable convergence journal
+// (hash-chained `convergence:<operationId>` records inside the ordinary
+// receipts). The bridge folds facts into it every turn, observes the
+// authoritative work snapshot, computes readiness, and — only in mapAnswers —
+// reserves/emits the independent verification, goal-status and synthesis arms.
+// Empty/new (pre-P7) sessions keep the v6 compatibility path; an active P7
+// journal under an unpaired extension escalates under stable key `pair-p7`.
+
+const ARM_SLOT = /^(verification|goal_status|synthesis):(.+)$/;
+const sha256Hex = (input) => createHash("sha256").update(input).digest("hex");
+
+function canonicalJson(value) {
+  return JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+}
+
+function canonicalSession(path) {
+  try { return recovery.canonicalSessionPath(path); } catch { return undefined; }
+}
+
+/** One JSON entry per line of a session log; unparseable lines are skipped. */
+function sessionEntries(sessionFile) {
+  if (!sessionFile) return [];
+  let raw;
+  try { raw = readFileSync(sessionFile, "utf8"); } catch { return []; }
+  const entries = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try { const parsed = JSON.parse(trimmed); if (parsed && typeof parsed === "object") entries.push(parsed); } catch { /* not an entry line */ }
+  }
+  return entries;
+}
+
+/** Custom entries (subagent-spawn / subagent-complete / inbox-item / …). */
+function sessionCustomEntries(sessionFile) {
+  return sessionEntries(sessionFile).filter((entry) => entry?.type === "custom" && typeof entry.customType === "string");
+}
+
+/** Canonical task_update messages from the persisted session log. */
+function persistedSessionMessages(sessionFile) {
+  return sessionEntries(sessionFile).flatMap((entry) => sessionMessages.sessionMessagesFrom(entry));
+}
+
+/** P4 canonical task_update corrections for the authorized subtree, ordered. */
+export function canonicalCorrections(req) {
+  const authorized = new Set((req.state?.taskTree?.tasks ?? []).map((task) => task.id));
+  const entries = new Map();
+  const add = (entry) => {
+    if (!entry || typeof entry.operationId !== "string" || !entry.operationId) return;
+    if (typeof entry.correction !== "string" || !entry.correction) return;
+    if (entry.taskIds?.length && !entry.taskIds.some((id) => authorized.has(id))) return;
+    const identity = entry.identity ?? JSON.stringify(["task_update", entry.childId ?? entry.sessionFile ?? "", entry.operationId, entry.taskRevision ?? 0]);
+    if (!entries.has(identity)) entries.set(identity, entry);
+  };
+  for (const message of persistedSessionMessages(req.agent?.sessionFile)) {
+    if (message.kind !== "task_update") continue;
+    add({operationId: message.operationId, taskRevision: message.taskRevision, correction: message.payload?.correction,
+      taskIds: message.taskIds, childId: message.childId, sessionFile: message.sessionFile,
+      identity: sessionMessages.taskUpdateIdentity(message)});
+  }
+  for (const decision of req.state?.sessionMessages?.taskUpdates ?? []) {
+    add({operationId: decision.operationId, taskRevision: decision.revision, correction: decision.correction,
+      taskIds: decision.taskIds, identity: typeof decision.id === "string" ? decision.id : undefined});
+  }
+  return [...entries.values()].sort((a, b) =>
+    (a.taskRevision ?? 0) - (b.taskRevision ?? 0) || (a.operationId < b.operationId ? -1 : a.operationId > b.operationId ? 1 : 0));
+}
+
+/** The exact acceptance bytes: the initial task event plus every canonical P4 correction. */
+export function acceptanceCriteria(req) {
+  const events = req.events ?? [];
+  const initial = events.find((e) => (e.type === "user_input" || e.type === "parent_message") && typeof e.text === "string") ??
+    events.find((e) => e.type === "notification" && e.payload?.fromParent === true && typeof e.text === "string");
+  // Fallback: the parent-authored spawn task env (PI_SUBAGENT_TASK), the same
+  // memory-only source resolveGoal uses — carried verbatim, never budgeted.
+  // Used only when no initial event survives the transcript (offline fixtures
+  // and spawned runs whose brief lives in the env); never a restatement.
+  const envTask = typeof process.env.PI_SUBAGENT_TASK === "string" ? process.env.PI_SUBAGENT_TASK : null;
+  const initialText = initial ? String(initial.text) : envTask;
+  if (!initialText || !initialText.trim()) {
+    return {hold: {key: "p7-acceptance", title: "Acceptance criteria missing",
+      body: "NOT completed. No canonical initial task event carries the acceptance criteria; no classifier-authored restatement is an acceptance source."}};
+  }
+  return {text: [initialText, ...canonicalCorrections(req).map((entry) => entry.correction)].join("\n\n")};
+}
+
+/** The authorized subtree projected onto the shared ConvergenceTaskSchema. */
+function convergenceTasks(req) {
+  const tree = taskTreeOf(req);
+  if (!tree.available || !tree.ok) return null;
+  return (tree.tree.tasks ?? []).map((task) => ({
+    id: task.id, text: String(task.text ?? ""), status: task.status,
+    ...(task.parentTaskId !== undefined ? {parentTaskId: task.parentTaskId} : {}),
+    ...(task.supersededBy !== undefined ? {supersededBy: task.supersededBy} : {}),
+    ...(task.ref !== undefined ? {ref: String(task.ref)} : {}),
+    ...(task.assignedToId !== undefined ? {assignedToId: String(task.assignedToId)} : {}),
+  }));
+}
+
+/** A task ref is a commit in req.agent.cwd (exact ref string as version) or a readable regular file (sha256). */
+function taskRefEntry(task, cwd) {
+  const ref = typeof task.ref === "string" ? task.ref.trim() : "";
+  if (!ref) return [task.id, null, null, null];
+  if (/^[0-9a-f]{7,40}$/i.test(ref)) {
+    try {
+      const check = spawnSync("git", ["cat-file", "-t", ref], {cwd, timeout: 5000});
+      if (check.status === 0 && String(check.stdout).trim() === "commit") return [task.id, ref, "commit", ref];
+    } catch { /* not a repository — fall through to the file check */ }
+  }
+  const path = isAbsolute(ref) ? ref : resolve(cwd, ref);
+  try {
+    const stat = statSync(path);
+    if (stat.isFile() && stat.size > 0) return [task.id, ref, "sha256", sha256Hex(readFileSync(path))];
+  } catch { /* unreadable */ }
+  return {hold: {key: `p7-taskref-${task.id}`, infrastructureIssue: true, title: `Task #${task.id} evidence ref is unusable`,
+    body: `NOT completed. Task #${task.id} ref "${ref}" is neither a commit in ${cwd} nor a readable regular file; no prose/path/mtime surrogate may stand in.`}};
+}
+
+function durableReportPath(row) {
+  for (const candidate of [row.resultStorePath, row.sessionFile ? `${row.sessionFile}.report` : null]) {
+    if (typeof candidate !== "string" || !isAbsolute(candidate)) continue;
+    try { const stat = statSync(candidate); if (stat.isFile() && stat.size > 0) return candidate; } catch { /* unreadable */ }
+  }
+  return null;
+}
+
+/**
+ * The exact WorkSnapshotSchema: acceptance bytes, authorized tasks, every
+ * work-purpose attempt child, the canonical implementation revision, and the
+ * durable report manifest (report:<childId> ids, absolute paths, digests).
+ */
+export function workSnapshot(req, receipts) {
+  const tasks = convergenceTasks(req);
+  if (!tasks) {
+    return {hold: {key: "p7-tree", title: "Authoritative task snapshot unavailable",
+      body: `NOT completed. Missing task-store authority is a hold, never an empty task tree: ${taskTreeOf(req).error ?? "task tree unavailable"}.`}};
+  }
+  const cwd = req.agent?.cwd ?? process.cwd();
+  const taskRefs = [];
+  for (const task of [...tasks].sort((a, b) => a.id - b.id)) {
+    const entry = taskRefEntry(task, cwd);
+    if (entry.hold) return {hold: entry.hold};
+    taskRefs.push(entry);
+  }
+  const acceptance = acceptanceCriteria(req);
+  if (acceptance.hold) return {hold: acceptance.hold};
+  const workRows = Object.values(receipts.lifecycle).filter((row) => row.purpose === "work")
+    .map((row) => [row.childId, row.attempt ?? 1, row.state, row.resumedFrom ?? null, canonicalSession(row.sessionFile) ?? null])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const workChildIds = [...new Set(Object.values(receipts.lifecycle).filter((row) => row.purpose === "work").map((row) => row.childId))];
+  // scopeOperationIds: P4 correction history + committed task-update batch operationIds.
+  const calls = callArgsById(req.events ?? []);
+  const scopeOperationIds = [...new Set([
+    ...canonicalCorrections(req).map((entry) => entry.operationId),
+    ...Object.entries(receipts.operations).filter(([, operation]) => operation.tool === "task_update" || operation.tool === "task")
+      .map(([id]) => id.replace(/^task-update-consumed:/, "")),
+    ...(Array.isArray(req.events) ? req.events.flatMap((e) => {
+      if (e.type !== "tool_result" || !["task", "task_update"].includes(e.tool)) return [];
+      const call = calls.get(e.callId);
+      const operationId = call?.args?.operationId ?? e.details?.operationId;
+      return typeof operationId === "string" && operationId ? [operationId] : [];
+    }) : []),
+  ])].sort();
+  // recoveryOperationIds: admitted recovery intents, resume reservations and resume controls.
+  const recoveryOperationIds = [...new Set([
+    ...Object.entries(receipts.operations).filter(([id, operation]) =>
+      id.startsWith("recovery-intent:") && (operation.acknowledgement || operation.effect)).map(([id]) => id),
+    ...Object.keys(receipts.resumeReservations),
+    ...Object.entries(receipts.operations).filter(([, operation]) =>
+      operation.effect?.tool === "subagent_resume" && receipts.lifecycle[operation.effect.childId]?.purpose === "work")
+      .map(([id]) => id),
+  ])].sort();
+  const reports = Object.values(receipts.lifecycle)
+    .filter((row) => row.purpose)
+    .map((row) => {
+      const path = durableReportPath(row);
+      if (!path || row.state === "spawn_pending") return null;
+      return {id: `report:${row.childId}`, path, childId: row.childId, purpose: row.purpose, evidenceRevision: sha256Hex(readFileSync(path))};
+    })
+    .filter(Boolean);
+  return {snapshot: {
+    acceptanceCriteria: acceptance.text,
+    tasks,
+    workChildIds,
+    implementationRevision: sha256Hex(Buffer.from(JSON.stringify([workRows, scopeOperationIds, recoveryOperationIds, taskRefs]), "utf8")),
+    reports,
+  }};
+}
+
+/** The engine is the single P7 writer: observe the canonical snapshot at the next sequence. */
+export function observeP7Work(req) {
+  const sessionFile = req.agent?.sessionFile;
+  if (!sessionFile) return {error: "no canonical parent agent.sessionFile"};
+  let service;
+  let state;
+  try {
+    service = convergence.createConvergenceServices(sessionFile);
+    state = service.read();
+  } catch (err) {
+    return {error: `convergence state unreadable: ${err?.message ?? err}`};
+  }
+  const loaded = readOrchReceipts(sessionFile);
+  if (loaded.corrupt) return {error: `orchestration receipts unreadable: ${loaded.error}`};
+  const built = workSnapshot(req, loaded.receipts);
+  if (built.hold) return {hold: built.hold};
+  const snapshot = built.snapshot;
+  if (state.snapshot && canonicalJson(state.snapshot) === canonicalJson(snapshot)) return {ok: true, unchanged: true};
+  try {
+    service.observe(`snapshot:${state.sequence + 1}:${convergence.workFingerprint(snapshot)}`, snapshot);
+  } catch (err) {
+    return {error: `convergence observation failed: ${err?.message ?? err}`};
+  }
+  return {ok: true};
+}
+
+/**
+ * Extension/bridge pairing (spec §1). Returns {mode:'active'} when the P7
+ * contract is fully satisfied, {mode:'pair', problems} when an active P7
+ * journal is paired with an old/missing extension surface, and {mode:'compat'}
+ * for empty/new sessions, which keep the v6 compatibility path.
+ */
+export function p7PairingProblem(req, receipts, ledger) {
+  const convState = req.state?.convergence;
+  const activeJournal = Object.keys(receipts.operations ?? {}).some((id) => id.startsWith("convergence:")) ||
+    (convState?.state?.sequence ?? 0) > 0 || (convState?.state?.tickets?.length ?? 0) > 0;
+  const problems = [];
+  if (req.capabilities?.completionKind !== true) problems.push("capabilities.completionKind missing");
+  if (req.capabilities?.completionDecisions !== true) problems.push("capabilities.completionDecisions missing");
+  if (req.capabilities?.convergence !== 1) problems.push("capabilities.convergence missing (old extension)");
+  if (convState?.v !== 1) problems.push("state.convergence.v missing (old extension)");
+  if (!req.agent?.sessionFile) problems.push("no canonical parent agent.sessionFile");
+  const context = req.state?.convergenceContext;
+  if (!context || typeof context.cwd !== "string" || context.cwd !== req.agent?.cwd) problems.push("state.convergenceContext invalid");
+  if (!Array.isArray(req.state?.inboxDecisions)) problems.push("state.inboxDecisions not durable");
+  if (req.state?.convergenceError) problems.push(`state.convergenceError: ${req.state.convergenceError}`);
+  const completions = completionRows(req);
+  if (completions.error) problems.push(`completion journal error: ${completions.error}`);
+  if (ledger?.corrupt) problems.push(`orchestration ledger corrupt: ${ledger.error}`);
+  if (ledger?.writeError) problems.push(`orchestration ledger write failed: ${ledger.writeError}`);
+  if (!activeJournal) return {mode: "compat", problems};
+  if (!problems.length) return {mode: "active"};
+  return {mode: "pair", problems};
+}
+
+/** Durable mutation facts folded through service.mutation before any dispatch/terminal attempt. */
+function p7MutationFacts(req, receipts, repairOpen) {
+  const facts = [];
+  for (const entry of canonicalCorrections(req)) {
+    if (receipts.operations[`convergence:${entry.operationId}`]?.effect) continue;
+    facts.push({operationId: entry.operationId, reason: repairOpen ? "repair" : "scope"});
+  }
+  for (const [id, operation] of Object.entries(receipts.operations)) {
+    if (id.startsWith("recovery-intent:") && (operation.acknowledgement || operation.effect) && !receipts.operations[`convergence:${id}`]?.effect) {
+      facts.push({operationId: id, reason: "replacement"});
+    }
+  }
+  for (const id of Object.keys(receipts.resumeReservations)) {
+    if (receipts.operations[`convergence:${id}`]?.effect) continue;
+    facts.push({operationId: id, reason: "resume"});
+  }
+  for (const [id, operation] of Object.entries(receipts.operations)) {
+    if (operation.effect?.tool === "subagent_resume" && receipts.lifecycle[operation.effect.childId]?.purpose === "work" &&
+        !receipts.operations[`convergence:${id}`]?.effect) facts.push({operationId: id, reason: "resume"});
+  }
+  return facts;
+}
+
+/**
+ * Fold canonical lifecycle facts into the shared convergence journal:
+ * mutations, arm launches from acknowledgements, arm completions from
+ * lifecycle rows, admission failures from p7-<kind>-<ticketId> escalations,
+ * and crash detection for reserved tickets with no spawn call at all.
+ * Stable operation ids make every fold a no-op on replay.
+ */
+export function foldP7Facts(req) {
+  const out = {errors: [], launchFailures: [], completionProblems: []};
+  const sessionFile = req.agent?.sessionFile;
+  if (!sessionFile) return out;
+  let service;
+  let state;
+  try {
+    service = convergence.createConvergenceServices(sessionFile);
+    state = service.read();
+  } catch (err) {
+    out.errors.push(`convergence state unreadable: ${err?.message ?? err}`);
+    return out;
+  }
+  const reload = () => {
+    const loaded = readOrchReceipts(sessionFile);
+    return loaded.receipts;
+  };
+  const run = (work) => {
+    try { work(); } catch (err) { out.errors.push(err?.message ?? String(err)); }
+  };
+  if (state.snapshot) {
+    const repairOpen = state.verification?.result.verdict === "changes_required";
+    for (const fact of p7MutationFacts(req, reload(), repairOpen)) {
+      run(() => service.mutation(fact.operationId, fact.reason));
+    }
+  }
+  // Admission-failure escalations the extension emitted for a reserved arm slot.
+  for (const [id, operation] of Object.entries(reload().operations)) {
+    const match = /^escalation:p7-(verification|goal_status|synthesis)-(.+)$/.exec(id);
+    if (!match || !operation.acknowledgement || operation.acknowledgement.isError) continue;
+    const ticketId = match[2];
+    const fresh = service.read();
+    if (ticketId && fresh.tickets.some((ticket) => ticket.id === ticketId && ticket.status === "reserved")) {
+      run(() => service.launch(ticketId, {isError: true, details: {infraIssue: true}}));
+    }
+  }
+  const events = req.events ?? [];
+  const calls = callArgsById(events);
+  // Arm launches from the ordinary subagent acknowledgement.
+  for (const e of events) {
+    if (e.type !== "tool_result" || e.tool !== "subagent") continue;
+    const call = calls.get(e.callId);
+    const slot = call?.spawn?.slot ?? call?.args?.spawnSlot;
+    const binding = ARM_SLOT.exec(slot ?? "");
+    if (!binding) continue;
+    const ticketId = binding[2];
+    const fresh = service.read();
+    if (!fresh.tickets.some((ticket) => ticket.id === ticketId && ticket.status === "reserved")) continue;
+    run(() => service.launch(ticketId, {isError: e.isError === true, details: isRecord(e.details) ? e.details : {}}));
+  }
+  // Crash between reservation and emission: reserved, no call carries the slot, no lifecycle row.
+  const freshTickets = service.read().tickets;
+  const rows = reload();
+  for (const ticket of freshTickets) {
+    if (ticket.status !== "reserved") continue;
+    const slot = `${ticket.kind}:${ticket.id}`;
+    const callCarries = events.some((e) => e.type === "decision" && Array.isArray(e.calls) && e.calls.some((call) =>
+      (call.spawn?.slot ?? call.args?.spawnSlot) === slot));
+    const rowCarries = Object.values(rows.lifecycle).some((row) => row.spawnSlot === slot);
+    if (callCarries || rowCarries) continue; // a call without its acknowledgement holds, never relaunches
+    out.launchFailures.push({ticketId: ticket.id, slot, key: `p7-launch-${ticket.id}`});
+    run(() => service.launch(ticket.id, {isError: true, details: {infraIssue: true}}));
+  }
+  // Arm completions from canonical lifecycle facts (purpose/report from the ledger, not the child).
+  const finalTickets = service.read().tickets;
+  const finalRows = reload();
+  for (const ticket of finalTickets) {
+    if (ticket.status !== "running" || !ticket.childId) continue;
+    const row = finalRows.lifecycle[ticket.childId];
+    if (!row || !["completed", "failed", "killed", "exited-without-done"].includes(row.state)) continue;
+    const completion = {
+      childId: row.childId,
+      purpose: row.purpose,
+      completionKind: row.completionKind ?? row.state,
+      reportRef: row.sessionFile ? `${row.sessionFile}.report` : "",
+      structured: row.structured,
+      schemaViolated: row.schemaViolated === true,
+      infraIssue: row.infraIssue === true,
+    };
+    try { service.complete(ticket.id, completion); }
+    catch (err) { out.completionProblems.push({ticketId: ticket.id, error: err?.message ?? String(err)}); }
+  }
+  return out;
+}
+
+/** All mandatory RunReadiness fields (spec §4); nonzero counts block reservation and done. */
+export function p7Readiness(req, convState, ledger) {
+  const sessionFile = req.agent?.sessionFile;
+  const loaded = readOrchReceipts(sessionFile);
+  const receipts = loaded.receipts;
+  const tree = taskTreeOf(req);
+  const tasks = convergenceTasks(req);
+  const completions = completionRows(req);
+  const inboxItems = sessionFile && inbox?.reconstructInbox ? [...inbox.reconstructInbox(sessionCustomEntries(sessionFile)).values()] : [];
+  const liveStates = ["spawn_pending", "running", "interrupted", "resumed"];
+  // Spec §4 descendants: start with direct lifecycle children, transitively follow
+  // parentChildId, and merge rows from descendants' canonical session ledgers and the
+  // authorized tasks' ownerSessionFile routes. Dedupe by child id, no depth cap:
+  // a completed/killed ancestor never hides a live descendant.
+  const rowOf = new Map();
+  for (const row of Object.values(receipts.lifecycle)) rowOf.set(row.childId, row);
+  const liveIds = new Set();
+  const known = new Set(Object.keys(receipts.lifecycle));
+  const visitedSessions = new Set();
+  let routeBroken = false;
+  const visitSession = (path, linkOnly) => {
+    const canonical = canonicalSession(path);
+    if (!canonical || visitedSessions.has(canonical)) return [];
+    visitedSessions.add(canonical);
+    const child = readOrchReceipts(canonical);
+    if (child.corrupt) {
+      // An unavailable owning route makes authority false, never an empty list.
+      if (linkOnly) routeBroken = true;
+      return [];
+    }
+    const added = [];
+    for (const row of Object.values(child.receipts.lifecycle)) {
+      if (rowOf.has(row.childId)) continue;
+      rowOf.set(row.childId, row);
+      added.push(row.childId);
+    }
+    return added;
+  };
+  visitedSessions.add(canonicalSession(sessionFile));
+  // Owner routes merge rows only: they link into the tree through parentChildId.
+  for (const task of tasks ?? []) if (task.ownerSessionFile) visitSession(task.ownerSessionFile, true);
+  const queue = [...known];
+  while (queue.length) {
+    const id = queue.pop();
+    const row = rowOf.get(id);
+    // A known descendant's canonical session ledger carries its own children.
+    if (row?.sessionFile) for (const childId of visitSession(row.sessionFile, false)) {
+      known.add(childId);
+      queue.push(childId);
+    }
+    // Link rows whose parentChildId points at this descendant, whatever ledger they live in.
+    for (const [childId, candidate] of rowOf) {
+      if (!known.has(childId) && candidate.parentChildId === id) {
+        known.add(childId);
+        queue.push(childId);
+      }
+    }
+  }
+  for (const id of known) {
+    const row = rowOf.get(id);
+    if (row && liveStates.includes(row.state)) liveIds.add(id);
+  }
+  const asks = new Set(pendingAsks(req.events ?? []).map((ask) => ask.askId));
+  for (const [id, ask] of Object.entries(req.state?.sessionMessages?.asks ?? {})) if (ask?.status === "pending") asks.add(id);
+  for (const row of req.state?.completionDecisions ?? []) for (const id of row?.pendingAskIds ?? []) asks.add(id);
+  const notifications = new Set((req.state?.taskUpdateOutbox?.pending ?? []).map((row) => row.key));
+  for (const completion of req.state?.sessionMessages?.completions ?? []) {
+    const identity = completion.resultStorePath ?? completion.eventId;
+    if (identity && !receipts.consumedCompletions.includes(`${completion.childId}:${identity}`)) notifications.add(completion.eventId ?? identity);
+  }
+  const actions = new Set();
+  for (const id of Object.keys(req.state?.sessionMessages?.operations ?? {})) actions.add(id);
+  for (const [id, operation] of Object.entries(receipts.operations)) {
+    if (operation.intent && !operation.acknowledgement && !operation.effect && !operation.reconciled) actions.add(id);
+  }
+  for (const row of completions.rows) {
+    if (row.status === "offered" && completionDecisions.isPendingCompletion(row)) actions.add(`completion-terminal:${row.offer?.completionId}`);
+  }
+  for (const ticket of convState?.tickets ?? []) if (ticket.status === "reserved") actions.add(`convergence:launch:${ticket.id}`);
+  const recoveries = new Set();
+  for (const [id, operation] of Object.entries(receipts.operations)) {
+    if (id.startsWith("recovery-intent:") && !operation.effect && !operation.reconciled) recoveries.add(id);
+    if (id.startsWith("recovery-effect:") && !operation.acknowledgement && !operation.effect) recoveries.add(id);
+  }
+  for (const [id, reservation] of Object.entries(receipts.resumeReservations)) {
+    // Spec §4: a reservation without a reconciled launch outcome blocks. The
+    // reservation id doubles as its recovery-effect operation id, so an
+    // acknowledged committed effect closes it; the resumed child's lifecycle
+    // row (any outcome, success or failure) is the corresponding launch
+    // outcome. A consumed reservation alone is not launch success.
+    const operation = receipts.operations[id];
+    if (operation?.acknowledgement && operation?.effect) continue;
+    const resumedBy = receipts.lifecycle[reservation.childId]?.resumedBy;
+    if (resumedBy && receipts.lifecycle[resumedBy]) continue;
+    recoveries.add(id);
+  }
+  const statusScouts = new Set([
+    ...statusReconciliation.pendingStatusReconciliations(receipts).map((mark) => mark.operationId),
+    ...(req.state?.statusReconciliation?.unresolved ?? []).map((mark) => mark.operationId),
+  ]);
+  for (const row of Object.values(receipts.lifecycle)) {
+    if (row.purpose === "status_scout" && liveStates.includes(row.state)) statusScouts.add(row.spawnSlot ?? row.childId);
+  }
+  const approvals = new Set();
+  // Spec §4: an Inbox `decide` row releases only when its decision has been
+  // admitted as one of the offered finite options AND durably applied by
+  // P3/P5 — the durable reconciled receipt statusFaultHolds writes for the
+  // key-bound row (`infra-${reconciled.detail.key}`). A recorded decision shape
+  // without that receipt still blocks; a free-text/unoffered decision and an
+  // ack/dismissal alone can never release the gate.
+  // A same-key receipt of another disposition (parent-answered, reserved-tasks-revised)
+  // is not a durably applied Inbox decision and must not release the gate.
+  const reconciledInboxIds = new Set();
+  for (const operation of Object.values(receipts.operations)) {
+    const detail = operation?.reconciled?.detail;
+    if (typeof detail?.key === "string" && detail.disposition === "inbox-decided") reconciledInboxIds.add(`infra-${detail.key}`);
+  }
+  const admittedDecision = (item) => Boolean(item.decision && item.decision.other !== true &&
+    (!item.decide || item.decide.options.includes(item.decision.choice)) && reconciledInboxIds.has(item.id));
+  for (const item of inboxItems) if (item.decide && !admittedDecision(item)) approvals.add(item.id);
+  for (const item of req.state?.inboxDecisions ?? []) if (item.ackedTs !== undefined && !admittedDecision(item)) approvals.add(item.id);
+  return {
+    authoritative: Boolean(tree.available && tree.ok && req.state?.taskUpdateOutbox?.ok !== false && sessionFile &&
+      !loaded.corrupt && !ledger?.corrupt && !ledger?.writeError && !routeBroken && !req.state?.convergenceError && !completions.error && convState),
+    taskProblems: tasks ? convergence.taskClosureProblems(tasks) : ["authoritative task tree unavailable"],
+    liveChildren: liveIds.size,
+    pendingAsks: asks.size,
+    pendingNotifications: notifications.size,
+    pendingActions: actions.size,
+    pendingRecovery: recoveries.size,
+    pendingStatusScouts: statusScouts.size,
+    unresolvedApprovals: approvals.size,
+  };
+}
+
+/** Final forwarding preflight: the exact sidecar the forwarder will resolve, nothing else. */
+export function resolveP7Forward(state, req) {
+  if (!state.synthesis) return null;
+  const childId = state.synthesis.childId;
+  let spawn;
+  let completed = false;
+  for (const entry of sessionCustomEntries(req.agent?.sessionFile)) {
+    const data = isRecord(entry.data) ? entry.data : {};
+    if (data.id !== childId) continue;
+    if (entry.customType === "subagent-spawn") spawn = data;
+    else if (entry.customType === "subagent-complete") completed = true;
+  }
+  if (!spawn || !completed || typeof spawn.sessionFile !== "string" || !spawn.sessionFile.trim()) return null;
+  const path = `${spawn.sessionFile}.report`;
+  let stat;
+  try { stat = statSync(path); } catch { return null; }
+  if (!stat.isFile() || stat.size === 0) return null;
+  if (path !== state.synthesis.reportRef) return null;
+  return {childId, reportRef: path};
+}
+
+function escalateOnce(req, receipts, spec) {
+  if (escalationSent(req.events, spec.key, receipts)) {
+    return {say: `${spec.title} escalation already sent; holding.`, calls: []};
+  }
+  return escalateAction(req, spec);
+}
+
+function freshReceipts(sessionFile) {
+  return readOrchReceipts(sessionFile).receipts;
+}
+
+function convergenceService(req) {
+  return convergence.createConvergenceServices(req.agent.sessionFile);
+}
+
+function p7HeldConvergence(req, answers, p7) {
+  if (p7.hold) return {say: `Holding: the convergence work snapshot is unavailable (${p7.hold.title}).`, calls: []};
+  return p7ConvergenceAction(req, answers);
+}
+
+/** The repair_decision arm: finite options, escalation always available (spec §5). */
+function p7RepairDecision(req, service, state, answers) {
+  const ticketId = state.verification.ticketId;
+  const reportRef = state.verification.reportRef;
+  const findings = state.verification.result.findings;
+  const receipts = freshReceipts(req.agent.sessionFile);
+  if (!Object.hasOwn(answers ?? {}, "p7_repair")) {
+    return {say: "Repair decision arrived during classification; waiting for its notice.", calls: []};
+  }
+  const choice = answers.p7_repair?.choice;
+  if (choice === "escalate" || !choice) {
+    return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}:escalate`,
+      title: `Verification findings (${ticketId}) need repair or escalation`,
+      body: `NOT completed. Verifier report: ${reportRef}\nFindings:\n${findings.map((finding) => `- ${finding}`).join("\n")}`});
+  }
+  if (choice.startsWith("apply:")) {
+    const offer = completionRows(req).rows.find((row) => row.status === "offered" && completionDecisions.isPendingCompletion(row) &&
+      row.offer?.reportRef === reportRef);
+    const optionId = choice.slice("apply:".length);
+    if (!offer || !offer.offer.decisions.some((option) => option.id === optionId)) {
+      return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}`, infrastructureIssue: true,
+        title: "Offered repair option is unavailable",
+        body: `NOT completed. No admitted completion offer carries option "${optionId}" for verifier ${ticketId}.`});
+    }
+    if (!req.tools.some((tool) => tool.name === "apply_decision")) {
+      return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}`, infrastructureIssue: true,
+        title: "Completion executor unavailable", body: `NOT completed. Reload with apply_decision. Report: ${reportRef}`});
+    }
+    try { service.mutation(`completion-action:${offer.offer.completionId}:${optionId}`, "repair"); }
+    catch (err) { return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}`, infrastructureIssue: true,
+      title: "Repair mutation failed", body: `NOT completed. ${err?.message ?? err}`}); }
+    return {say: `Applying the verifier-offered repair option ${optionId}.`, calls: [{
+      tool: "apply_decision",
+      args: {completionId: offer.offer.completionId, snapshotRevision: offer.offer.snapshotRevision,
+        offerHash: offer.offer.offerHash, reportRef: offer.offer.reportRef, optionId},
+      reason: "verifier-offered finite repair option",
+    }]};
+  }
+  if (choice === "dispatch_thinker") {
+    const slot = (req.spawnContexts ?? []).find((entry) => entry.purpose === "think");
+    if (!slot) {
+      return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}`, infrastructureIssue: true,
+        title: "No admitted thinker slot for repair reasoning",
+        body: `NOT completed. Verifier report: ${reportRef}\nFindings:\n${findings.map((finding) => `- ${finding}`).join("\n")}`});
+    }
+    // Spec §5: the recorded dispatch id makes replay a hold, never a re-think.
+    if (receipts.operations[`p7-repair:${ticketId}:dispatch_thinker`]?.effect) {
+      return {say: "Holding: the repair thinker dispatch is already recorded; replay cannot re-think.", calls: []};
+    }
+    const errors = [];
+    persistClaim(req.agent.sessionFile, freshReceipts(req.agent.sessionFile), {v: 1, seq: 0, ts: Date.now(),
+      operationId: `p7-repair:${ticketId}:dispatch_thinker`, tool: "repair_dispatch", phase: "effect",
+      detail: {ticketId, reportRef}}, errors);
+    if (errors.length) return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}`, infrastructureIssue: true,
+      title: "Repair dispatch journal write failed", body: `NOT completed. ${errors.join("; ")}`});
+    return {say: `Dispatching the repair thinker with the verifier findings (${ticketId}).`, calls: [{
+      tool: "subagent", args: {agent: "thinker", purpose: "think"}, spawn: {slot: slot.id},
+      reason: "repair reasoning routed to an admitted thinker slot",
+    }]};
+  }
+  return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}`, infrastructureIssue: true,
+    title: "Unoffered repair option", body: `NOT completed. "${choice}" is not an offered repair option.`});
+}
+
+/** The synthesis_correction_decision arm: corrected synthesis or escalation, nothing else. */
+function p7SynthesisCorrection(req, service, state, answers) {
+  const prior = state.tickets.at(-1);
+  const ticketId = prior?.id ?? "synthesis";
+  const receipts = freshReceipts(req.agent.sessionFile);
+  if (!Object.hasOwn(answers ?? {}, "p7_synthesis_correction")) {
+    return {say: "Synthesis correction decision arrived during classification; waiting for its notice.", calls: []};
+  }
+  const choice = answers.p7_synthesis_correction?.choice;
+  if (choice !== "corrected_synthesis") {
+    return escalateOnce(req, receipts, {key: `p7-synthesis-correction:${ticketId}`,
+      title: `Synthesis coverage (${ticketId}) needs correction or escalation`,
+      body: `NOT completed. Prior synthesis report: ${prior?.reportRef ?? "(none)"}\nCoverage problems:\n${(state.synthesisProblems ?? []).map((problem) => `- ${problem}`).join("\n")}`});
+  }
+  const readiness = p7Readiness(req, service.read(), {corrupt: false, writeError: null});
+  const fresh = service.read();
+  const nextId = `synthesis-${fresh.sequence + 1}`;
+  let reservedState;
+  try { reservedState = service.reserve(nextId, "synthesis", readiness); }
+  catch (err) {
+    return escalateOnce(req, receipts, {key: `p7-synthesis-correction:${ticketId}`, infrastructureIssue: true,
+      title: "Corrected synthesis could not be reserved", body: `NOT completed. ${err?.message ?? err}`});
+  }
+  if (reservedState.failure) return p7ConvergenceAction(req, answers);
+  return {say: `Reserving the corrected synthesis arm (${nextId}).`, calls: [{
+    tool: "subagent", args: {agent: "worker", purpose: "synthesis"}, spawn: {slot: `synthesis:${nextId}`},
+    reason: "corrected synthesis reserved",
+  }]};
+}
+
+/**
+ * The P7 convergence selection (mapAnswers only): wait/verify/synthesize/
+ * repair/synthesis-correction/forward/escalate from convergenceNext, gated on
+ * clean readiness. Reservation precedes emission; caps and terminal failure
+ * live in the shared state machine, never in classifier confidence.
+ */
+export function p7ConvergenceAction(req, answers) {
+  const sessionFile = req.agent.sessionFile;
+  const receipts = freshReceipts(sessionFile);
+  let service;
+  let state;
+  try {
+    service = convergenceService(req);
+    state = service.read();
+  } catch (err) {
+    return escalateOnce(req, receipts, {key: "p7-state", infrastructureIssue: true,
+      title: "Convergence journal is unreadable", body: `NOT completed. ${err?.message ?? err}`});
+  }
+  const next = convergence.convergenceNext(state);
+  if (next.kind === "escalate") {
+    // Spec §5: only the §3 admission/crash path's recorded key for THIS failure
+    // (the failed ticket's own escalation) may be reused; any other acknowledged
+    // p7-* escalation does not suppress the single stable-key p7-failure emit.
+    const failedKeys = state.tickets.filter((ticket) => ticket.status === "failed").flatMap((ticket) =>
+      [`escalation:p7-${ticket.kind}-${ticket.id}`, `escalation:p7-launch-${ticket.id}`]);
+    const recorded = failedKeys.some((key) => receipts.operations[key]?.acknowledgement);
+    if (recorded || escalationSent(req.events, "p7-failure", receipts)) {
+      return {say: "Holding: the P7 failure escalation is already recorded.", calls: []};
+    }
+    return escalateAction(req, {key: "p7-failure", infrastructureIssue: true,
+      title: "Convergence run failed — NOT completed",
+      body: `NOT completed. The independent convergence run failed terminally: ${state.failure}. Recovery requires a new session; no retry, no receipt reset, and no further ticket is authorized in this session.`});
+  }
+  if (next.kind === "wait") return {say: "Holding: an independent convergence arm is reserved or running.", calls: []};
+  if (next.kind === "repair_decision") return p7RepairDecision(req, service, state, answers);
+  if (next.kind === "synthesis_correction_decision") return p7SynthesisCorrection(req, service, state, answers);
+  if (next.kind === "forward") {
+    let available;
+    try { available = resolveP7Forward(state, req); } catch { available = null; }
+    if (!available) {
+      return escalateOnce(req, receipts, {key: "p7-forward", infrastructureIssue: true,
+        title: "Synthesis report is not available for exact forwarding",
+        body: `NOT completed. The completed direct synthesis child's subagent-spawn/subagent-complete entries, nonempty ${"`${child.sessionFile}.report`"} sidecar and matching state.synthesis.reportRef preflight failed; the forwarder's fallback must not turn an engine placeholder into a success report.`});
+    }
+    try {
+      const args = service.forward(p7Readiness(req, service.read(), {corrupt: false, writeError: null}), available);
+      return {terminal: true, say: "Forwarding the verified synthesis report verbatim.",
+        calls: [{tool: "subagent_done", args, reason: "converged through P7 verification and synthesis"}]};
+    } catch (err) {
+      return escalateOnce(req, receipts, {key: "p7-forward", infrastructureIssue: true,
+        title: "Final forwarding gate refused", body: `NOT completed. ${err?.message ?? err}`});
+    }
+  }
+  // verify / synthesize
+  const readiness = p7Readiness(req, state, {corrupt: false, writeError: null});
+  if (readiness.authoritative !== true || readiness.taskProblems.length ||
+      ["liveChildren", "pendingAsks", "pendingNotifications", "pendingActions", "pendingRecovery", "pendingStatusScouts", "unresolvedApprovals"]
+        .some((field) => readiness[field] !== 0)) {
+    return {say: `Holding: convergence readiness is not clean (${[
+      ...(readiness.authoritative !== true ? ["authoritative state unavailable"] : []),
+      ...readiness.taskProblems,
+      ...["liveChildren", "pendingAsks", "pendingNotifications", "pendingActions", "pendingRecovery", "pendingStatusScouts", "unresolvedApprovals"]
+        .filter((field) => readiness[field] !== 0).map((field) => `${field}: ${readiness[field]}`),
+    ].join("; ")}).`, calls: []};
+  }
+  if (!req.tools.some((tool) => tool.name === "subagent")) {
+    return escalateOnce(req, receipts, {key: "p7-spawn", infrastructureIssue: true,
+      title: "Convergence arm cannot be spawned",
+      body: "NOT completed. This session has no subagent spawn tool, so independent verification/synthesis is impossible here."});
+  }
+  const kind = next.kind === "synthesize" ? "synthesis" : state.snapshot.workChildIds.length > 0 ? "verification" : "goal_status";
+  const ticketId = `${kind}-${state.sequence + 1}`;
+  let reservedState;
+  try { reservedState = service.reserve(ticketId, kind, readiness); }
+  catch (err) {
+    const after = (() => { try { return service.read(); } catch { return null; } })();
+    if (after?.failure) return p7ConvergenceAction(req, answers);
+    return escalateOnce(req, receipts, {key: `p7-${kind}-${ticketId}`, infrastructureIssue: true,
+      title: `Convergence ${kind} arm could not be reserved`,
+      body: `NOT completed. ${err?.message ?? err}\nspawn_slot: ${kind}:${ticketId}`});
+  }
+  if (reservedState.failure) return p7ConvergenceAction(req, answers);
+  const agent = kind === "synthesis"
+    ? (answers?.worker_agent?.choice && answers.worker_agent.choice !== "other" ? answers.worker_agent.choice : "worker")
+    : scoutAgent(req) ?? "scout";
+  return {say: `Reserving the independent ${kind} arm (${ticketId}) at work revision ${reservedState.workRevision}.`,
+    calls: [{tool: "subagent", args: {agent, purpose: kind === "synthesis" ? "synthesis" : "verification_scout"},
+      spawn: {slot: `${kind}:${ticketId}`}, reason: `convergence ${kind} arm reserved at work revision ${reservedState.workRevision}`}]};
+}
+
+/** Implementation appears closed: every authorized task closed with evidence and no live work child. */
+function p7ImplementationClosed(req) {
+  const tree = taskTreeOf(req);
+  const tasks = convergenceTasks(req);
+  if (!tree.available || !tree.ok || !tasks) return false;
+  if (convergence.taskClosureProblems(tasks).length) return false;
+  const receipts = freshReceipts(req.agent?.sessionFile);
+  return !Object.values(receipts.lifecycle).some((row) => row.purpose === "work" &&
+    ["spawn_pending", "running", "interrupted", "resumed"].includes(row.state));
+}
+
+/**
+ * mapAnswers wrapper (P7): pairing → fold → observe → P3–P6 handlers → P7
+ * convergence selection. Empty/new sessions keep the v6 path unchanged.
+ */
+export function mapAnswers(answers, req) {
+  if (doneAlreadyCalled(req.events)) {
+    return {terminal: true, say: "Already reported done; ending.", calls: []};
+  }
+  const sessionFile = req.agent?.sessionFile;
+  const first = sessionFile
+    ? mergedWorkers(sessionFile, req.events, req.capabilities)
+    : {rows: [], ledger: {corrupt: false}, receipts: emptyReceipts()};
+  const pairing = p7PairingProblem(req, first.receipts, first.ledger);
+  if (pairing.mode === "pair") {
+    if (escalationSent(req.events, "pair-p7", first.receipts)) {
+      return {say: "P7 pairing escalation already sent; reload the paired extension and bridge.", calls: []};
+    }
+    return escalateAction(req, {key: "pair-p7", infrastructureIssue: true, title: "P7 extension/bridge pair required",
+      body: `NOT completed. An active P7 convergence journal requires the paired extension's convergence contracts and durable projections: ${pairing.problems.join("; ")}. Reload both together before resuming this session's decisions; an unpaired run may not spawn, dispatch, or report success.`});
+  }
+  if (pairing.mode === "compat") return mapAnswersCore(answers, req, {active: false});
+  // Active P7 session: fold, observe, then the P3–P6 handlers, then the P7 selection.
+  const receipts = freshReceipts(sessionFile);
+  const fold = foldP7Facts(req);
+  const holdSpec = fold.errors.length
+    ? {key: "p7-state", infrastructureIssue: true, title: "Convergence journal failure", body: `NOT completed. ${fold.errors.join("; ")}`}
+    : fold.completionProblems.length
+      ? {key: `p7-complete:${fold.completionProblems.map((problem) => problem.ticketId).sort().join(",")}`, infrastructureIssue: true,
+        title: "Independent arm completion is not foldable", body: `NOT completed. ${fold.completionProblems.map((problem) => `${problem.ticketId}: ${problem.error}`).join("; ")}`}
+      : fold.launchFailures.length
+        ? {key: fold.launchFailures[0].key, infrastructureIssue: true, title: "Reserved convergence launch unresolved",
+          body: `NOT completed. Ticket ${fold.launchFailures[0].ticketId} is reserved with no spawn call or acknowledgement in the transcript.\nspawn_slot: ${fold.launchFailures[0].slot}`}
+        : null;
+  const observed = observeP7Work(req);
+  const observeHold = observed.error
+    ? {key: "p7-observe", infrastructureIssue: true, title: "Convergence observation failed", body: `NOT completed. ${observed.error}`}
+    : observed.hold ?? null;
+  const p7 = {active: true, hold: holdSpec ?? observeHold};
+  const v6 = mapAnswersCore(answers, req, p7);
+  const passive = !v6.calls?.length;
+  const genericSpawn = v6.calls?.length === 1 && v6.calls[0].tool === "subagent" &&
+    !v6.calls[0].spawn?.slot && !v6.calls[0].args?.tasks;
+  if (p7.hold && (passive || genericSpawn)) return escalateOnce(req, freshReceipts(sessionFile), p7.hold);
+  if (p7ImplementationClosed(req) && (passive || genericSpawn)) return p7ConvergenceAction(req, answers);
+  return v6;
+}
+
+/**
+ * buildRequest wrapper (P7): pairing → fold → observe, then the v6 request
+ * body plus convergence facts and the finite repair/synthesis-correction
+ * questions. buildRequest only exposes decisions; emission stays in mapAnswers.
+ */
+export function buildRequest(req) {
+  const result = buildRequestCore(req);
+  const sessionFile = req.agent?.sessionFile;
+  if (!sessionFile) return result;
+  const {receipts, ledger} = mergedWorkers(sessionFile, req.events, req.capabilities);
+  const pairing = p7PairingProblem(req, receipts, ledger);
+  if (pairing.mode === "compat") return result;
+  if (pairing.mode === "pair") {
+    return {...result, state: {...result.state, p7_pairing_error: pairing.problems.join("; ")}};
+  }
+  const fold = foldP7Facts(req);
+  const observed = observeP7Work(req);
+  let convState;
+  try { convState = convergenceService(req).read(); } catch { convState = undefined; }
+  const next = convState ? convergence.convergenceNext(convState) : undefined;
+  const questions = {...result.questions};
+  if (next?.kind === "repair_decision") {
+    const completions = completionRows(req);
+    const offered = completions.rows.find((row) => row.status === "offered" && completionDecisions.isPendingCompletion(row) &&
+      row.offer?.reportRef === convState.verification.reportRef);
+    const thinker = (req.spawnContexts ?? []).some((slot) => slot.purpose === "think");
+    questions.p7_repair = {type: "choice",
+      instructions: `Independent verification (${convState.verification.ticketId}) returned changes_required. Verifier report: ${convState.verification.reportRef}. Findings:\n${convState.verification.result.findings.map((finding) => `- ${finding}`).join("\n")}\nChoose exactly one repair route; escalation is always available. Repair work must land as admitted task updates before any re-verification.`,
+      criteria: {
+        escalate: "Emit NOT completed with the verifier report pointer and findings verbatim.",
+        ...(thinker ? {dispatch_thinker: "Dispatch one admitted thinker slot with the verifier findings to obtain repair task edits/briefs (report-only; no implementation)."} : {}),
+        ...(offered ? Object.fromEntries(offered.offer.decisions.map((option) => [`apply:${option.id}`, `Execute the verifier's admitted offered option "${option.id}" exactly through apply_decision.`])) : {}),
+      }};
+  }
+  if (next?.kind === "synthesis_correction_decision") {
+    const prior = convState.tickets.at(-1);
+    questions.p7_synthesis_correction = {type: "choice",
+      instructions: `Synthesis coverage missed obligations. Prior synthesis report: ${prior?.reportRef ?? "(none)"}. Coverage problems:\n${(convState.synthesisProblems ?? []).map((problem) => `- ${problem}`).join("\n")}\nChoose exactly one: the single corrected synthesis attempt, or escalation.`,
+      criteria: {
+        corrected_synthesis: "Reserve the corrected synthesis arm with the prior pointer and coverage obligations.",
+        escalate: "Emit NOT completed with the prior synthesis pointer and exact coverage problems.",
+      }};
+  }
+  return {...result, questions, state: {...result.state,
+    ...(convState ? {convergence: {v: 1, state: convState}} : {}),
+    ...(fold.errors.length ? {p7_journal_error: fold.errors.join("; ")} : {}),
+    ...(fold.launchFailures.length ? {p7_launch_failures: fold.launchFailures} : {}),
+    ...(observed.error ? {p7_observe_error: observed.error} : {}),
+    ...(observed.hold ? {p7_snapshot_hold: observed.hold.body} : {}),
+  }};
 }
