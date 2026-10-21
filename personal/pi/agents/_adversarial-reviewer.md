@@ -3,10 +3,11 @@ description: Helix adversarial code-review stage — one of two context-isolated
 spawning: false
 session-mode: lineage-only
 tools: read, bash
+replace-base: [tools]
 deny-tools: write, edit, task
 system-prompt: append
 ---
-model: anthropic/claude-opus-5-5
+model: anthropic-250k-prefer-using-this-one/claude-opus-5-5
 
 # adversarial-reviewer (base — do not spawn directly)
 

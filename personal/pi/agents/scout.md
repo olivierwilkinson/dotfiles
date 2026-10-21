@@ -1,6 +1,7 @@
 ---
-model: fireworks-300k/fireworks:accounts/fireworks/routers/glm-5p3-flash
-tools: read, bash, tool_gateway_search_tools, tool_gateway_describe, tool_gateway_run_tool, perplexity_search, perplexity_fetch
+model: fireworks-300k/fireworks:accounts/fireworks/models/glm-5p3-flash
+tools: read, bash, tool_gateway_search_tools, tool_gateway_describe, tool_gateway_run_tool, perplexity_search, perplexity_fetch, lmtools_code_search, lmtools_code_history, lmtools_code_map, lmtools_code_index_status
+replace-base: [tools]
 system-prompt: append
 ---
 

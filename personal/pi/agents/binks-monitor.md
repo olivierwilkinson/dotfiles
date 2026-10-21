@@ -1,6 +1,7 @@
 ---
 description: Watches Shopify's Binks automated code review on ONE pull request via a tracked background script that polls until the review reaches a terminal state, streams each finding to the parent with full comment details as it lands, records resolution outcomes the orchestrator messages back, and writes an advisory report categorizing findings as auto-resolved vs needs-user-attention. Read-only — never replies, resolves, pushes, or edits code.
 tools: read, bash
+replace-base: [tools]
 thinking: medium
 spawning: false
 system-prompt: append

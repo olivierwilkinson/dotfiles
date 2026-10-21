@@ -5,6 +5,7 @@ thinking: medium
 spawning: false
 session-mode: lineage-only
 tools: read, write, bash, check_in
+replace-base: [tools]
 deny-tools: edit, task
 system-prompt: append
 ---
