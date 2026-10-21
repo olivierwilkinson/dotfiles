@@ -1,5 +1,5 @@
 ---
-model: fireworks-300k/fireworks:accounts/fireworks/models/glm-5p3-flash
+model: decision/jev
 base-subagent: orchestrator
 tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, task, stream, bash
 ---
