@@ -1,6 +1,6 @@
 ---
 description: The admin-mobile-next orchestrator with its judgment calls routed through jev — the swappable decision-model engine. Same two-track pipeline and same tooling workarounds; track selection, gate selection, retry-vs-escalate, failure attribution and done-ness are decided by the engine, and this agent executes those decisions instead of making them.
-model: fireworks-300k/fireworks:accounts/fireworks/models/glm-5p3-flash
+model: decision/jev
 base-subagent: mobile-orchestrator
 thinking: medium
 tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagent_resume, subagents_list, subagents_roster, subagent_ask_parent, subagent_answer_parent, subagent_wait, task, task_update, apply_decision, stream, complete_task, check_in, reminder, background_script, bash, read, write, lmtools_code_update, lmtools_code_interest_add, lmtools_code_interest_list, lmtools_code_interest_generate

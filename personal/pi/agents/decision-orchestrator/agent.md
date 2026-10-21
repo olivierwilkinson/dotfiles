@@ -1,6 +1,6 @@
 ---
-description: Orchestrator driven by the jev decision engine (TypeSafe System One via Shopify AI Proxy) instead of an LLM. Overrides the bundled placeholder with the shop-pi-fy jev extension wiring.
-model: fireworks-300k/fireworks:accounts/fireworks/models/glm-5p3-flash
+description: Orchestrator driven by the jev decision engine (TypeSafe System One via Shopify AI Proxy) instead of an LLM. Uses the vendored System One client in the pi-subagents-extension bridge.
+model: decision/jev
 spawning: true
 reminders:
   - on: waiting
