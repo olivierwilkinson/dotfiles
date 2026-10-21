@@ -743,7 +743,7 @@ function unconsumedThinker(workers, asks) {
  *  or a terminal NOT-completed report the LLM parent must surface. A
  *  forwarded ask's answer auto-chains to the asking child without waking this
  *  session (the child's subagent_done converges the run). */
-function escalateAction(req, { key, title, body, markerAskId, forwardAskId = null, infrastructureIssue = false }) {
+function escalateAction(req, { key, title, body, markerAskId, forwardAskId = null, infrastructureIssue = false, decide }) {
   const marker = `escalation_for: ${markerAskId ?? key}`;
   if (req.tools.some((t) => t.name === "escalate")) {
     return {
@@ -754,6 +754,7 @@ function escalateAction(req, { key, title, body, markerAskId, forwardAskId = nul
           args: {
             ...(infrastructureIssue ? {infrastructureIssue: true} : {update: true}),
             key,
+            ...(decide ? {decide} : {}),
             // Inbox caps: title 60, summary 80 (a long askId must not fault the call).
             title: title.slice(0, 60),
             summary: title.slice(0, 80),
@@ -1065,6 +1066,8 @@ export function scoutSpawnCall(req, mark) {
 
 const liveWorker = (worker) => worker.running || (worker.state === "spawn_pending" && !worker.spawn_failed);
 const ownRun = (req, task) => Boolean(req.agent?.id && task.assignedToId === req.agent.id && task.status === "in_progress");
+const blocking = (req, task) => !ownRun(req, task) && !["done", "replaced"].includes(task.status);
+const RESUME_RECONCILIATION = "Receipts reconciled; resume decisions";
 function writerInWorktree(req, workers) {
   const cwd = resolve(req.agent?.cwd ?? process.cwd());
   // Legacy work rows without a cwd conservatively share our worktree: serialize, never risk two writers.
@@ -1087,8 +1090,9 @@ function reservedTasks(req, receipts, exceptOperationId) {
   }
   return reserved;
 }
-/** Status faults hold work/convergence, but asks keep routing. Only a linked parent
- * answer or a newer revision of every reserved task releases the durable hold. */
+/** Status faults hold work/convergence, but asks keep routing. A linked parent
+ * answer, key-bound durable Inbox decision, or newer revision of every reserved
+ * task releases the hold. An Inbox dismiss alone is never authorization. */
 function statusFaultHolds(req, receipts, errors) {
   const tree = taskTreeOf(req);
   const holds = [];
@@ -1113,10 +1117,13 @@ function statusFaultHolds(req, receipts, errors) {
     const answered = req.events.some((event) => event.type === "notification" && event.kind === "answer" &&
       (event.source === "subagent_parent_answer" || event.message?.source === "parent-inbox") &&
       [key, askId].filter(Boolean).includes(event.payload?.askId ?? event.message?.askId));
-    if (answered || revised) {
+    const inboxAnswered = escalation?.acknowledgement && !escalation.acknowledgement.isError &&
+      req.state?.inboxDecisions?.some((item) => item.id === `infra-${key}` &&
+        item.decision?.choice === RESUME_RECONCILIATION && item.decision.other === false);
+    if (answered || inboxAnswered || revised) {
       persistClaim(req.agent?.sessionFile, receipts, {v: 1, seq: 0, ts: Date.now(), operationId,
         tool: "status_reconciliation", phase: "reconciled", childId: ack.childId,
-        detail: {disposition: answered ? "parent-answered" : "reserved-tasks-revised", key}}, errors);
+        detail: {disposition: answered ? "parent-answered" : inboxAnswered ? "inbox-decided" : "reserved-tasks-revised", key}}, errors);
     }
     if (!receipts.operations[operationId]?.reconciled) holds.push({operationId, key, error: ack.error});
   }
@@ -1124,16 +1131,28 @@ function statusFaultHolds(req, receipts, errors) {
 }
 
 /** A tasks-assigned jev may delegate its own run through the provider's slot.
- * Never use that fallback to redo reserved/closed/blocked descendant work. */
+ * Closed descendants travel as evidence refs; never redo reserved/blocked work. */
 function defaultWorkCall(req, agentType, workers, receipts) {
   const tree = taskTreeOf(req);
-  if (tree.available && (!tree.ok || tree.tree.tasks.some((task) => !ownRun(req, task)))) return null;
+  if (tree.available && (!tree.ok || tree.tree.tasks.some((task) => blocking(req, task)))) return null;
   const slot = req.spawnContexts?.find((slot) => slot.id === "default-work");
   if (!slot || writerInWorktree(req, workers) || (slot.taskIds ?? []).some((id) => reservedTasks(req, receipts).has(id))) return null;
   return {say: "Delegating the assigned run through the provider's default-work slot.", calls: [{
     tool: "subagent", args: {agent: agentType, purpose: "work"}, spawn: {slot: slot.id},
     reason: "provider-owned assigned-run dispatch",
   }]};
+}
+
+/** With no live child there is no wake source: request one keyed disposition,
+ * rather than silently holding on blocked/foreign/reserved task state. */
+function taskDispatchHold(req, tree, workers, receipts) {
+  const tasks = tree.ok ? tree.tree.tasks.filter((task) => blocking(req, task) || reservedTasks(req, receipts).has(task.id)) : [];
+  const say = "Holding: authorized tasks are reserved, owned or not open; never redo the goal prose.";
+  if (workers.some(liveWorker)) return {say, calls: []};
+  const key = inboxKey("tt", tasks.map((task) => task.id).sort((a, b) => a - b).join(",") || "no-eligible-dispatch");
+  if (escalationSent(req.events, key, receipts)) return {say: `${say} Task-disposition escalation already sent.`, calls: []};
+  return escalateAction(req, {key, title: "Authorized tasks have no eligible dispatch",
+    body: `Goal was NOT completed. Authoritative tasks require disposition: ${tasks.map((task) => `#${task.id} (${task.status})`).join(", ") || "task snapshot unavailable"}. No live child can advance this hold.`});
 }
 
 /** All three worker paths share task authority, reconciliation reservation and one-writer admission. */
@@ -1345,7 +1364,9 @@ export function mapAnswers(answers, req) {
   if (unsentHold) return escalateAction(req, {key: unsentHold.key, infrastructureIssue: true,
     title: "Task reconciliation needs recovery",
     body: `NOT completed. ${unsentHold.operationId}: ${unsentHold.error}. Reserved tasks cannot dispatch and convergence is held. ` +
-      `Answer this escalation after checking the task receipts, or revise every reserved task to authorize new work.`});
+      `After checking the task receipts, choose "${RESUME_RECONCILIATION}" in the Inbox decision (not dismiss), ` +
+      `answer the linked parent ask, or revise every reserved task to authorize new work. This releases decisions, not task completion.`,
+    decide: {question: "Have the authoritative task receipts been reconciled?", options: [RESUME_RECONCILIATION]}});
 
   const completions = completionRows(req);
   if (completions.error) {
@@ -1367,7 +1388,8 @@ export function mapAnswers(answers, req) {
 
   // P4 join: a committed parent task-update decision offers finite options with
   // escalate always appended. Selection executes its one typed action; nothing
-  // here re-mutates the committed batch.
+  // here re-mutates the committed batch. Even during a status-fault hold,
+  // explicit parent task-update decisions may dispatch non-reserved tasks.
   const taskUpdateDecision = consumedTaskUpdates(req, receipts)[0];
   let decisionHold = statusHolds.length > 0;
   const consumeUpdate = (disposition) => {
@@ -1702,8 +1724,8 @@ export function mapAnswers(answers, req) {
     if (eligibleTask) return taskDispatchCall(req, eligibleTask, agentType, "task-driven zero-worker guard", {rows: workers, receipts});
     const assignedRun = defaultWorkCall(req, agentType, workers, receipts);
     if (assignedRun) return assignedRun;
-    if (tree.available && (!tree.ok || tree.tree.tasks.some((task) => !ownRun(req, task)))) {
-      return {say: "Holding: authorized tasks have no eligible dispatch; never redo the goal prose.", calls: []};
+    if (tree.available && (!tree.ok || tree.tree.tasks.some((task) => blocking(req, task) || reservedTasks(req, receipts).has(task.id)))) {
+      return taskDispatchHold(req, tree, workers, receipts);
     }
     const name = `Worker ${workers.length + 1}`;
     const task =
@@ -1757,7 +1779,7 @@ export function mapAnswers(answers, req) {
       });
     }
     const tree = taskTreeOf(req);
-    const unclosed = tree.available && tree.ok ? tree.tree.tasks.filter((task) => !ownRun(req, task) && !["done", "replaced"].includes(task.status)) : [];
+    const unclosed = tree.available && tree.ok ? tree.tree.tasks.filter((task) => blocking(req, task)) : [];
     if (unclosed.length) {
       const key = inboxKey("tt", unclosed.map((task) => task.id).sort((a, b) => a - b).join(","));
       if (escalationSent(req.events, key, receipts)) return {say: "Holding: authorized task outcomes remain unclosed.", calls: []};
@@ -1837,9 +1859,9 @@ ${w.report.trim().slice(0, 1500)}`)
     if (dispatched) return dispatched;
     const assignedRun = defaultWorkCall(req, agentType, workers, receipts);
     if (assignedRun) return assignedRun;
-    if (treeInfo.available && (!treeInfo.ok || treeInfo.tree.tasks.some((task) => !ownRun(req, task)))) return {
-      say: "Holding: authorized tasks are reserved, owned or not open; never redo the goal prose.", calls: [],
-    };
+    if (treeInfo.available && (!treeInfo.ok || treeInfo.tree.tasks.some((task) => blocking(req, task) || reservedTasks(req, receipts).has(task.id)))) {
+      return taskDispatchHold(req, treeInfo, workers, receipts);
+    }
     return {
       say: `Spawning ${name} (${agentType}) for the goal.`,
       calls: [
