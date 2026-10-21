@@ -2474,10 +2474,12 @@ export function p7Readiness(req, convState, ledger) {
   // key-bound row (`infra-${reconciled.detail.key}`). A recorded decision shape
   // without that receipt still blocks; a free-text/unoffered decision and an
   // ack/dismissal alone can never release the gate.
+  // A same-key receipt of another disposition (parent-answered, reserved-tasks-revised)
+  // is not a durably applied Inbox decision and must not release the gate.
   const reconciledInboxIds = new Set();
   for (const operation of Object.values(receipts.operations)) {
-    const key = operation?.reconciled?.detail?.key;
-    if (typeof key === "string") reconciledInboxIds.add(`infra-${key}`);
+    const detail = operation?.reconciled?.detail;
+    if (typeof detail?.key === "string" && detail.disposition === "inbox-decided") reconciledInboxIds.add(`infra-${detail.key}`);
   }
   const admittedDecision = (item) => Boolean(item.decision && item.decision.other !== true &&
     (!item.decide || item.decide.options.includes(item.decision.choice)) && reconciledInboxIds.has(item.id));

@@ -1111,6 +1111,15 @@ describe("bridge P7 convergence (v7)", () => {
     // reconciled receipt still blocks: shape alone is not durable application.
     appendEntry(fx.sessionFile, item({choice: "ship", other: false, ts: 4}));
     assert.deepEqual(blockers().mapped.calls, [], "an admitted decision shape without the durable P5 receipt blocks");
+    // Same-key receipts of OTHER dispositions (parent-answered, reserved-tasks-revised)
+    // do not release the gate: only a durably applied Inbox decision can.
+    for (const disposition of ["parent-answered", "reserved-tasks-revised"]) {
+      const alt = readOrchReceipts(fx.sessionFile).receipts;
+      alt.operations["status-fault:sf-2"] = {reconciled: {phase: "reconciled",
+        detail: {disposition, key: "key-2"}}};
+      assert.equal(saveOrchReceipts(fx.sessionFile, structuredClone(alt)).ok, true);
+      assert.deepEqual(blockers().mapped.calls, [], `a same-key ${disposition} receipt cannot release the approval gate`);
+    }
     // The same decision with the durable P5 reconciled receipt (the
     // statusFaultHolds application claim for key "key-2") releases the gate.
     const receipts = readOrchReceipts(fx.sessionFile).receipts;
