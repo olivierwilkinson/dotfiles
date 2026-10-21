@@ -214,6 +214,16 @@ function acknowledged(event) {
   return (event.acknowledgement ?? normalizeAcknowledgement(event)).successful;
 }
 
+function canonicalResumePath(path) {
+  try {
+    return recovery.canonicalSessionPath(path);
+  } catch (error) {
+    // A bad transcript path is no match, not a fault of the entire turn.
+    process.stderr.write(`jev-bridge: cannot canonicalize resume path ${JSON.stringify(path)}: ${error?.message ?? error}; ignoring this target\n`);
+    return undefined;
+  }
+}
+
 /**
  * Re-fold the sliding transcript window on every pass. Operation ids and
  * stable completion ids deduplicate effects; lifecycle guards prevent an old
@@ -327,8 +337,10 @@ export function foldEvents(receipts, events, capabilities) {
       }
       const rows = Object.values(receipts.lifecycle);
       const byId = args.id ?? args.subagentId ?? (e.tool !== "subagent_resume" ? details.id ?? details.childId : undefined);
+      const sessionPath = e.tool === "subagent_resume" && args.sessionPath
+        ? canonicalResumePath(args.sessionPath) : undefined;
       const candidates = e.tool === "subagent_resume" && args.sessionPath
-        ? rows.filter((r) => r.sessionFile && recovery.canonicalSessionPath(r.sessionFile) === recovery.canonicalSessionPath(args.sessionPath) && !r.resumedBy)
+        ? rows.filter((r) => sessionPath && r.sessionFile && !r.resumedBy && canonicalResumePath(r.sessionFile) === sessionPath)
         : byId ? rows.filter((r) => r.childId === byId)
           : rows.filter((r) => r.name === args.name);
       // Never guess an unrelated transcript when canonical-path lookup fails.
