@@ -28,7 +28,7 @@ import { createJiti } from "@mariozechner/jiti";
 const JEV_EXTENSION =
   "/Users/olivier/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/index.ts";
 // Bump when the extension must distinguish a pinned, older bridge process.
-export const BRIDGE_VERSION = 4;
+export const BRIDGE_VERSION = 5;
 if (process.argv.includes("--version")) {
   process.stdout.write(`jev-bridge ${BRIDGE_VERSION}\n`);
   process.exit(0);
@@ -743,7 +743,7 @@ function unconsumedThinker(workers, asks) {
  *  or a terminal NOT-completed report the LLM parent must surface. A
  *  forwarded ask's answer auto-chains to the asking child without waking this
  *  session (the child's subagent_done converges the run). */
-function escalateAction(req, { key, title, body, markerAskId, forwardAskId = null, infrastructureIssue = false, decide }) {
+function escalateAction(req, { key, title, body, parentBody = body, markerAskId, forwardAskId = null, infrastructureIssue = false, decide }) {
   const marker = `escalation_for: ${markerAskId ?? key}`;
   if (req.tools.some((t) => t.name === "escalate")) {
     return {
@@ -772,7 +772,7 @@ function escalateAction(req, { key, title, body, markerAskId, forwardAskId = nul
         {
           tool: "subagent_ask_parent",
           args: {
-            question: `ESCALATION REQUEST (needs the user)${marker ? ` — ${marker}` : ""}: ${title}\n\n${body}`,
+            question: `ESCALATION REQUEST (needs the user)${marker ? ` — ${marker}` : ""}: ${title}\n\n${parentBody}`,
             ...(forwardAskId
               ? { forwardAskId, message: `Child ask ${forwardAskId} forwarded: ${title}` }
               : {}),
@@ -1152,7 +1152,7 @@ function taskDispatchHold(req, tree, workers, receipts) {
   const key = inboxKey("tt", tasks.map((task) => task.id).sort((a, b) => a - b).join(",") || "no-eligible-dispatch");
   if (escalationSent(req.events, key, receipts)) return {say: `${say} Task-disposition escalation already sent.`, calls: []};
   return escalateAction(req, {key, title: "Authorized tasks have no eligible dispatch",
-    body: `Goal was NOT completed. Authoritative tasks require disposition: ${tasks.map((task) => `#${task.id} (${task.status})`).join(", ") || "task snapshot unavailable"}. No live child can advance this hold.`});
+    body: `Goal was NOT completed. Authoritative tasks require disposition: ${tasks.map((task) => `#${task.id} (${task.status})`).join(", ") || "no eligible provider slot for the assigned run"}. No live child can advance this hold. Fix task state or supply the missing provider slot, then answer; an answer alone does not repair task state.`});
 }
 
 /** All three worker paths share task authority, reconciliation reservation and one-writer admission. */
@@ -1360,13 +1360,30 @@ export function mapAnswers(answers, req) {
     if (escalationSent(req.events, key, receipts)) return {say: "Reconciliation journal write failed; waiting for recovery.", calls: []};
     return escalateAction(req, {key, infrastructureIssue: true, title: "Reconciliation journal write failed", body: `NOT completed. ${problem}`});
   }
-  const unsentHold = statusHolds.find((hold) => !escalationSent(req.events, hold.key, receipts));
-  if (unsentHold) return escalateAction(req, {key: unsentHold.key, infrastructureIssue: true,
-    title: "Task reconciliation needs recovery",
-    body: `NOT completed. ${unsentHold.operationId}: ${unsentHold.error}. Reserved tasks cannot dispatch and convergence is held. ` +
-      `After checking the task receipts, choose "${RESUME_RECONCILIATION}" in the Inbox decision (not dismiss), ` +
-      `answer the linked parent ask, or revise every reserved task to authorize new work. This releases decisions, not task completion.`,
-    decide: {question: "Have the authoritative task receipts been reconciled?", options: [RESUME_RECONCILIATION]}});
+  // A new bridge under an older loaded extension must not silently lose the
+  // durable Inbox recovery projection (or run with the pre-pair task CAS).
+  if (!Array.isArray(req.state?.inboxDecisions) &&
+      (req.state?.taskTree?.tasks?.length || reconciliation.unresolved?.length || statusHolds.length)) {
+    const key = "pair-p5";
+    if (escalationSent(req.events, key, receipts)) return {say: "P5 pairing escalation already sent; reload the paired extension and bridge.", calls: []};
+    return escalateAction(req, {key, infrastructureIssue: true, title: "P5 extension/bridge pair required",
+      body: "NOT completed. jev-bridge v5 requires the paired extension's expectedTaskRevision task-bound completion CAS and state.inboxDecisions projection. Reload both together before resuming P5 decisions."});
+  }
+  // Re-upsert the SAME key when a root row was dismissed without deciding.
+  // The production upsert clears its ack; the next full-session projection
+  // then stops reopening it. Dismissal itself never authorizes release.
+  const unsentHold = statusHolds.find((hold) => !escalationSent(req.events, hold.key, receipts) ||
+    (req.tools.some((tool) => tool.name === "escalate") && req.state?.inboxDecisions?.some((item) =>
+      item.id === `infra-${hold.key}` && item.ackedTs !== undefined && !item.decision)));
+  if (unsentHold) {
+    const problem = `NOT completed. ${unsentHold.operationId}: ${unsentHold.error}. Reserved tasks cannot dispatch and convergence is held. `;
+    return escalateAction(req, {key: unsentHold.key, infrastructureIssue: true,
+      title: "Task reconciliation needs recovery",
+      body: problem + `After checking the task receipts, choose "${RESUME_RECONCILIATION}" in the Inbox decision (not dismiss), ` +
+        `or revise every reserved task to authorize new work. Dismissal reopens this same row on the next decision, including after reload. This releases decisions, not task completion.`,
+      parentBody: problem + "After checking the task receipts, answer this linked subagent_ask_parent request directly, or revise every reserved task to authorize new work. Forwarding it into your own Inbox does not answer this ask. This releases decisions, not task completion.",
+      decide: {question: "Have the authoritative task receipts been reconciled?", options: [RESUME_RECONCILIATION]}});
+  }
 
   const completions = completionRows(req);
   if (completions.error) {
@@ -1724,7 +1741,7 @@ export function mapAnswers(answers, req) {
     if (eligibleTask) return taskDispatchCall(req, eligibleTask, agentType, "task-driven zero-worker guard", {rows: workers, receipts});
     const assignedRun = defaultWorkCall(req, agentType, workers, receipts);
     if (assignedRun) return assignedRun;
-    if (tree.available && (!tree.ok || tree.tree.tasks.some((task) => blocking(req, task) || reservedTasks(req, receipts).has(task.id)))) {
+    if (tree.available && (!tree.ok || tree.tree.tasks.length > 0)) {
       return taskDispatchHold(req, tree, workers, receipts);
     }
     const name = `Worker ${workers.length + 1}`;
@@ -1784,7 +1801,7 @@ export function mapAnswers(answers, req) {
       const key = inboxKey("tt", unclosed.map((task) => task.id).sort((a, b) => a - b).join(","));
       if (escalationSent(req.events, key, receipts)) return {say: "Holding: authorized task outcomes remain unclosed.", calls: []};
       return escalateAction(req, {key, title: "Authorized tasks are not completed",
-        body: `Goal was NOT completed. Authoritative tasks still require disposition: ${unclosed.map((task) => `#${task.id} (${task.status})`).join(", ")}.`});
+        body: `Goal was NOT completed. Authoritative tasks still require disposition: ${unclosed.map((task) => `#${task.id} (${task.status})`).join(", ")}. Fix task state, then answer; an answer alone does not close these tasks.`});
     }
     // Own-run tasks remain owned/in_progress here. The parent's result delivery
     // reverts them and P5 scouts/completes them with evidence, rather than this
@@ -1859,7 +1876,7 @@ ${w.report.trim().slice(0, 1500)}`)
     if (dispatched) return dispatched;
     const assignedRun = defaultWorkCall(req, agentType, workers, receipts);
     if (assignedRun) return assignedRun;
-    if (treeInfo.available && (!treeInfo.ok || treeInfo.tree.tasks.some((task) => blocking(req, task) || reservedTasks(req, receipts).has(task.id)))) {
+    if (treeInfo.available && (!treeInfo.ok || treeInfo.tree.tasks.length > 0)) {
       return taskDispatchHold(req, treeInfo, workers, receipts);
     }
     return {
