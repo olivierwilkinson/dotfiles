@@ -1,6 +1,4 @@
 ---
-models:
-  - fireworks-300k/fireworks:accounts/fireworks/models/glm-5p3
 thinkingLevel: low
 system-prompt: append
 ---
