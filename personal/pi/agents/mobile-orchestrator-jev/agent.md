@@ -84,9 +84,9 @@ configuration change rather than a rewrite.
 ## The integration point — the engine is bound and live
 
 The `decision/jev` model id resolves to the **jev-bridge stdio engine**
-(`decision-orchestrator/scripts/jev-bridge.mjs`, configured once in the
-global `_base.md` `decisionEngines:` block): TypeSafe System One via the
-Shopify AI Proxy, proven end to end through live orchestrator runs — spawn
+(`/Users/olivier/.pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents/bridge/jev-bridge.mjs`,
+configured once in the global `_base.md` `decisionEngines:` block): TypeSafe
+System One via the Shopify AI Proxy, proven end to end through live orchestrator runs — spawn
 with agent-type selection from the roster, wait, dwell-reminder check-ins,
 child answers, completion wakes, and `subagent_done` convergence carrying
 the workers' real reports. Decisions cost $0.00 per the host's usage

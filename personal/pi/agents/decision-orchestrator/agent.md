@@ -15,8 +15,10 @@ tools: subagent, subagent_scope_change, subagent_answer_child, dismiss_ask, suba
 # Decision Orchestrator (jev via Shopify AI Proxy)
 
 Every turn of this agent is a decision from the jev engine, not a model
-completion. The stdio engine is `scripts/jev-bridge.mjs` (configured once in the
-global `_base.md` `decisionEngines:` block, inherited by this agent), which:
+completion. The stdio engine is
+`/Users/olivier/.pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents/bridge/jev-bridge.mjs`
+(configured once in the global `_base.md` `decisionEngines:` block, inherited
+by this agent), which:
 
 1. Reads the turn's DecisionRequest (goal, instructions, tool allowlist, events).
 2. Asks jev one question battery in a single call — `done` (noul), `next_action`
@@ -44,9 +46,9 @@ global `_base.md` `decisionEngines:` block, inherited by this agent), which:
 
 ## Files
 
-- `scripts/jev-bridge.mjs` — the stdio bridge (imports the shop-pi-fy jev
-  extension; no duplicated auth logic).
-- `scripts/node_modules` — symlink to the pi-subagents-extension checkout's
-  node_modules (jiti + typebox resolution for the bridge).
-- The extension itself: `~/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/`
+- `/Users/olivier/.pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents/bridge/jev-bridge.mjs`
+  — the active stdio bridge, maintained in pi-subagents-extension.
+- `scripts/node_modules` — legacy dependency symlink to the pi-subagents-extension
+  checkout's node_modules, retained for the deprecated dotfiles bridge.
+- The legacy bridge's jev dependency: `~/.pi/agent/git/github.com/shopify-playground/shop-pi-fy/extensions/jev/`
   (also symlinked into `~/.pi/agent/extensions/jev`).

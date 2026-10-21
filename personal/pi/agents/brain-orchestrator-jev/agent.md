@@ -19,9 +19,9 @@ The brain-orchestrator base applies unchanged: the args contract
 brain-drafter / brain-update-reconciler split, and the mechanical
 scope (worktrees, routing, integration — never content). This file
 changes only WHO decides. Under `model: decision/jev` every turn is a
-decision from the jev engine (the stdio bridge in
-`decision-orchestrator/scripts/jev-bridge.mjs`, configured in the
-global `_base.md`). Route mechanics, contract, safety rails and the
+decision from the jev engine (the stdio bridge at
+`/Users/olivier/.pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents/bridge/jev-bridge.mjs`,
+configured in the global `_base.md`). Route mechanics, contract, safety rails and the
 audit sidecar are documented in `decision-orchestrator/agent.md`.
 
 Engine specifics for this pipeline:

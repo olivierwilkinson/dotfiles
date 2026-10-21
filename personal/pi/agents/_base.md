@@ -8,7 +8,7 @@ decisionEngines:
     transport: stdio
     command: node
     args:
-      - /Users/olivier/.pi/agent/agents/decision-orchestrator/scripts/jev-bridge.mjs
+      - /Users/olivier/.pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents/bridge/jev-bridge.mjs
     timeoutMs: 30000
 ---
   

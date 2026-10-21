@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Deprecated: use /Users/olivier/.pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents/bridge/jev-bridge.mjs instead.
 // jev-bridge: stdio decision engine for the `decision` provider.
 //
 // Reads one pi-decision-v1 DecisionRequest JSON line on stdin, asks the jev

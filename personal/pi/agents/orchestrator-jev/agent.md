@@ -16,7 +16,8 @@ reminders:
 
 The base orchestrator's delegation rules apply unchanged; this file changes
 only WHO decides. Under `model: decision/jev` every turn is a decision from
-the jev engine (the stdio bridge in `decision-orchestrator/scripts/jev-bridge.mjs`,
+the jev engine (the stdio bridge at
+`/Users/olivier/.pi/agent/git/github.com/olivierwilkinson/pi-subagents-extension/pi-extension/subagents/bridge/jev-bridge.mjs`,
 configured in the global `_base.md`), not a model completion. The route
 mechanics, contract, safety rails and audit sidecar are documented in
 `decision-orchestrator/agent.md` — read that agent's doc for the details.
