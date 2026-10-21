@@ -1,6 +1,7 @@
 ---
 model: openai/gpt-6.1-sol
 thinking: high
+tools: read, bash, write, edit, complete_task, lmtools_code_update, lmtools_code_interest_add, lmtools_code_interest_list, lmtools_code_interest_remove
 system-prompt: append
 ---
 

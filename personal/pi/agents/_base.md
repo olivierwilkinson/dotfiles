@@ -1,7 +1,7 @@
 ---
 model: openai/gpt-6.1-sol
 compact-overflow-model: fireworks/accounts/fireworks/models/glm-5p3-flash
-tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagents_roster, subagents_list, subagent_interrupt, subagent_kill, subagent_resume, bash
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagents_roster, subagents_list, subagent_interrupt, subagent_kill, subagent_resume, bash, lmtools_code_search, lmtools_code_history, lmtools_code_map, lmtools_code_index_status
 # Shared decision engines: any agent with model `decision/<id>` inherits these.
 decisionEngines:
   jev:
