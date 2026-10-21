@@ -1032,6 +1032,124 @@ describe("bridge P7 convergence (v7)", () => {
     assert.match(String(refused.calls[0].args.description), /NOT completed/);
   });
 
+  it("case 14: resume reservations release pendingRecovery only on a reconciled launch outcome; consumed alone blocks", (t) => {
+    const fx = p7Fixture(t);
+    p7CompleteWorkRun(fx);
+    buildRequest(fx.req); // fold the work spawn into the durable ledger
+    const readiness = () => p7Readiness(fx.req, p7State(fx), {corrupt: false, writeError: null});
+    const plant = (mutate) => {
+      const receipts = readOrchReceipts(fx.sessionFile).receipts;
+      mutate(receipts);
+      assert.equal(saveOrchReceipts(fx.sessionFile, structuredClone(receipts)).ok, true);
+    };
+    const workRowKey = Object.keys(readOrchReceipts(fx.sessionFile).receipts.lifecycle)
+      .find((key) => readOrchReceipts(fx.sessionFile).receipts.lifecycle[key].purpose === "work");
+    assert.ok(workRowKey, "the fixture has a work lifecycle row");
+    // A consumed-but-unlaunched reservation blocks readiness forever without this reconciliation.
+    plant((receipts) => {
+      receipts.resumeReservations["recovery-effect:9:resume"] =
+        {childId: workRowKey, sessionFile: fx.sessionFile, attempt: 2, reservedAt: 1, consumed: true};
+    });
+    assert.equal(readiness().pendingRecovery, 1, "a consumed reservation alone is not launch success");
+    // Reconciled launch outcome 1: the reservation's own operation carries an acknowledged committed effect.
+    plant((receipts) => {
+      receipts.operations["recovery-effect:9:resume"] = {
+        intent: {phase: "intent"}, acknowledgement: {phase: "acknowledgement"}, effect: {phase: "effect"},
+      };
+    });
+    assert.equal(readiness().pendingRecovery, 0, "an acknowledged committed effect is a reconciled launch outcome");
+    assert.ok(readOrchReceipts(fx.sessionFile).receipts.resumeReservations["recovery-effect:9:resume"],
+      "the reservation persists; only its outcome reconciles");
+    // Reconciled launch outcome 2: the resumed child's lifecycle row (failure outcome) without an effect.
+    plant((receipts) => {
+      delete receipts.operations["recovery-effect:9:resume"];
+      receipts.lifecycle[workRowKey].resumedBy = "child-9";
+      receipts.lifecycle["child-9"] = {childId: "child-9", state: "failed", stateTs: 2, attempt: 2,
+        resumedFrom: workRowKey, purpose: "work", sessionFile: fx.sessionFile};
+    });
+    assert.equal(readiness().pendingRecovery, 0, "the resumed child's lifecycle row closes the reservation, success or failure");
+    // A second outstanding reservation still blocks (dedupe by reservation id).
+    plant((receipts) => {
+      receipts.resumeReservations["recovery-effect:10:resume"] =
+        {childId: workRowKey, sessionFile: fx.sessionFile, attempt: 3, reservedAt: 2, consumed: true};
+    });
+    assert.equal(readiness().pendingRecovery, 1, "another unlaunched reservation still blocks");
+  });
+
+  it("case 15: a replayed dispatch_thinker repair selection holds on the recorded dispatch id, never re-thinks", (t) => {
+    const fx = p7Fixture(t);
+    fx.req.spawnContexts.push({id: "think:t-1", purpose: "think", name: "Question: repair",
+      taskText: "Obtain repair edits", cwd: fx.dir, artifactRoot: fx.dir, lineage: ["root", "orch-1"]});
+    p7CompleteWorkRun(fx);
+    const verifyDrive = p7Drive(fx.req, {done: {noul: 0.95}, next_action: {choice: "report_done"}});
+    const verifier = verifyDrive.spawned;
+    p7ChildDone(fx.req, verifier, {structured: {verdict: "changes_required", evidence: ["tests.log"], findings: ["Broken test"]}});
+    const answers = {p7_repair: {choice: "dispatch_thinker"}, done: {noul: 0.95}, next_action: {choice: "report_done"}};
+    const first = p7Drive(fx.req, answers);
+    assert.equal(first.mapped.calls[0].tool, "subagent");
+    assert.equal(first.mapped.calls[0].args.agent, "thinker");
+    assert.equal(first.mapped.calls[0].spawn.slot, "think:t-1");
+    const replay = p7Drive(fx.req, answers);
+    assert.deepEqual(replay.mapped.calls, [], "replay cannot re-think: the recorded dispatch id holds");
+    assert.match(replay.mapped.say, /already recorded|cannot re-think/);
+  });
+
+  it("case 16: free-text/unoffered decisions cannot release the approval gate; an admitted finite-option decision can", (t) => {
+    const fx = p7Fixture(t);
+    p7CompleteWorkRun(fx);
+    const blockers = () => p7Drive(fx.req, {done: {noul: 0.98}, next_action: {choice: "report_done"}});
+    const item = (decision) => ({type: "custom", customType: "inbox-item",
+      data: {id: "infra-key-2", kind: "infra-issue", title: "Approve the widget", ts: 1,
+        decide: {question: "Approve?", options: ["ship", "hold"]}, ...(decision ? {decision} : {})}});
+    // A free-text "Other" decision does not release the gate.
+    appendEntry(fx.sessionFile, item({choice: "ship it my way", other: true, ts: 2}));
+    assert.deepEqual(blockers().mapped.calls, [], "a free-text decision cannot release the approval gate");
+    // An unoffered choice recorded as a real option does not release it either.
+    appendEntry(fx.sessionFile, item({choice: "maybe", other: false, ts: 3}));
+    assert.deepEqual(blockers().mapped.calls, [], "an unoffered choice cannot release the approval gate");
+    // An admitted finite-option decision, durably recorded, releases it.
+    appendEntry(fx.sessionFile, item({choice: "ship", other: false, ts: 4}));
+    const released = blockers();
+    assert.equal(released.mapped.calls[0]?.tool, "subagent", "an admitted finite-option decision releases the gate");
+  });
+
+  it("case 17: the repair apply-branch re-matches the persisted offer's reportRef against the verifier ticket", (t) => {
+    const changes = {verdict: "changes_required", evidence: ["tests.log"], findings: ["Broken test"]};
+    const prepare = () => {
+      const fx = p7Fixture(t);
+      p7CompleteWorkRun(fx);
+      const verifyDrive = p7Drive(fx.req, {done: {noul: 0.95}, next_action: {choice: "report_done"}});
+      const verifier = verifyDrive.spawned;
+      p7ChildDone(fx.req, verifier, {structured: changes});
+      return {fx, reportRef: `${verifier.childSession}.report`};
+    };
+    const plantOffer = (fx, reportRef) => {
+      const receipts = readOrchReceipts(fx.sessionFile).receipts;
+      receipts.operations["completion-offer:co-77"] = {intent: {phase: "intent"},
+        effect: {phase: "effect", detail: {offer: {completionId: "co-77", snapshotRevision: 0, offerHash: "hash-77",
+          reportRef, decisions: [{id: "opt-1"}]}}}};
+      assert.equal(saveOrchReceipts(fx.sessionFile, structuredClone(receipts)).ok, true);
+    };
+    const answers = {p7_repair: {choice: "apply:opt-1"}, done: {noul: 0.95}, next_action: {choice: "report_done"}};
+    // An option carried by an unrelated pending offer escalates; never apply_decision against the wrong completion.
+    const wrong = prepare();
+    plantOffer(wrong.fx, "/tmp/unrelated.report");
+    const wrongDrive = p7Drive(wrong.fx.req, answers);
+    assert.equal(wrongDrive.mapped.calls[0].tool, "escalate");
+    assert.equal(wrongDrive.mapped.calls[0].args.infrastructureIssue, true);
+    assert.match(wrongDrive.mapped.calls[0].args.description, /No admitted completion offer carries option/i);
+    // The offer whose reportRef matches the verifier ticket executes through apply_decision.
+    const right = prepare();
+    plantOffer(right.fx, right.reportRef);
+    const built = buildRequest(right.fx.req);
+    assert.ok(built.questions.p7_repair.criteria["apply:opt-1"], "only the matching offer's option is presented");
+    const rightDrive = p7Drive(right.fx.req, answers);
+    assert.equal(rightDrive.mapped.calls[0].tool, "apply_decision");
+    assert.equal(rightDrive.mapped.calls[0].args.completionId, "co-77");
+    assert.equal(rightDrive.mapped.calls[0].args.optionId, "opt-1");
+    assert.equal(rightDrive.mapped.calls[0].args.reportRef, right.reportRef);
+  });
+
   it("case 13: P0a–P6 fixtures stay green under the v7 bridge (compat path) and no P7 surface leaks into v6 sessions", () => {
     // The v6 describes above (resume fold + P5 reconciliation, 21 cases) are the P0a–P6
     // fixtures; this case pins the compat boundary they depend on.

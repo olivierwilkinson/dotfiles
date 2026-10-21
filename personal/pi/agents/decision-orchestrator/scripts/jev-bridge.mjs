@@ -2374,21 +2374,58 @@ export function p7Readiness(req, convState, ledger) {
   const completions = completionRows(req);
   const inboxItems = sessionFile && inbox?.reconstructInbox ? [...inbox.reconstructInbox(sessionCustomEntries(sessionFile)).values()] : [];
   const liveStates = ["spawn_pending", "running", "interrupted", "resumed"];
+  // Spec §4 descendants: start with direct lifecycle children, transitively follow
+  // parentChildId, and merge rows from descendants' canonical session ledgers and the
+  // authorized tasks' ownerSessionFile routes. Dedupe by child id, no depth cap:
+  // a completed/killed ancestor never hides a live descendant.
+  const rowOf = new Map();
+  for (const row of Object.values(receipts.lifecycle)) rowOf.set(row.childId, row);
   const liveIds = new Set();
+  const known = new Set(Object.keys(receipts.lifecycle));
   const visitedSessions = new Set();
-  const collectLive = (rows, depth) => {
-    for (const row of Object.values(rows.lifecycle)) {
-      if (liveStates.includes(row.state)) liveIds.add(row.childId);
-      const path = canonicalSession(row.sessionFile);
-      if (path && !visitedSessions.has(path) && depth < 3) {
-        visitedSessions.add(path);
-        const child = readOrchReceipts(path);
-        if (!child.corrupt) collectLive(child.receipts, depth + 1);
-      }
+  let routeBroken = false;
+  const visitSession = (path, linkOnly) => {
+    const canonical = canonicalSession(path);
+    if (!canonical || visitedSessions.has(canonical)) return [];
+    visitedSessions.add(canonical);
+    const child = readOrchReceipts(canonical);
+    if (child.corrupt) {
+      // An unavailable owning route makes authority false, never an empty list.
+      if (linkOnly) routeBroken = true;
+      return [];
     }
+    const added = [];
+    for (const row of Object.values(child.receipts.lifecycle)) {
+      if (rowOf.has(row.childId)) continue;
+      rowOf.set(row.childId, row);
+      added.push(row.childId);
+    }
+    return added;
   };
   visitedSessions.add(canonicalSession(sessionFile));
-  collectLive(receipts, 0);
+  // Owner routes merge rows only: they link into the tree through parentChildId.
+  for (const task of tasks ?? []) if (task.ownerSessionFile) visitSession(task.ownerSessionFile, true);
+  const queue = [...known];
+  while (queue.length) {
+    const id = queue.pop();
+    const row = rowOf.get(id);
+    // A known descendant's canonical session ledger carries its own children.
+    if (row?.sessionFile) for (const childId of visitSession(row.sessionFile, false)) {
+      known.add(childId);
+      queue.push(childId);
+    }
+    // Link rows whose parentChildId points at this descendant, whatever ledger they live in.
+    for (const [childId, candidate] of rowOf) {
+      if (!known.has(childId) && candidate.parentChildId === id) {
+        known.add(childId);
+        queue.push(childId);
+      }
+    }
+  }
+  for (const id of known) {
+    const row = rowOf.get(id);
+    if (row && liveStates.includes(row.state)) liveIds.add(id);
+  }
   const asks = new Set(pendingAsks(req.events ?? []).map((ask) => ask.askId));
   for (const [id, ask] of Object.entries(req.state?.sessionMessages?.asks ?? {})) if (ask?.status === "pending") asks.add(id);
   for (const row of req.state?.completionDecisions ?? []) for (const id of row?.pendingAskIds ?? []) asks.add(id);
@@ -2411,7 +2448,18 @@ export function p7Readiness(req, convState, ledger) {
     if (id.startsWith("recovery-intent:") && !operation.effect && !operation.reconciled) recoveries.add(id);
     if (id.startsWith("recovery-effect:") && !operation.acknowledgement && !operation.effect) recoveries.add(id);
   }
-  for (const id of Object.keys(receipts.resumeReservations)) recoveries.add(id);
+  for (const [id, reservation] of Object.entries(receipts.resumeReservations)) {
+    // Spec §4: a reservation without a reconciled launch outcome blocks. The
+    // reservation id doubles as its recovery-effect operation id, so an
+    // acknowledged committed effect closes it; the resumed child's lifecycle
+    // row (any outcome, success or failure) is the corresponding launch
+    // outcome. A consumed reservation alone is not launch success.
+    const operation = receipts.operations[id];
+    if (operation?.acknowledgement && operation?.effect) continue;
+    const resumedBy = receipts.lifecycle[reservation.childId]?.resumedBy;
+    if (resumedBy && receipts.lifecycle[resumedBy]) continue;
+    recoveries.add(id);
+  }
   const statusScouts = new Set([
     ...statusReconciliation.pendingStatusReconciliations(receipts).map((mark) => mark.operationId),
     ...(req.state?.statusReconciliation?.unresolved ?? []).map((mark) => mark.operationId),
@@ -2420,11 +2468,16 @@ export function p7Readiness(req, convState, ledger) {
     if (row.purpose === "status_scout" && liveStates.includes(row.state)) statusScouts.add(row.spawnSlot ?? row.childId);
   }
   const approvals = new Set();
-  for (const item of inboxItems) if (item.decide && !item.decision) approvals.add(item.id);
-  for (const item of req.state?.inboxDecisions ?? []) if (item.ackedTs !== undefined && !item.decision) approvals.add(item.id);
+  // Spec §4: only a decision admitted as one of the offered finite options and
+  // durably recorded releases the gate; a free-text/unoffered decision or an
+  // ack/dismissal alone cannot release it.
+  const admittedDecision = (item) => Boolean(item.decision && item.decision.other !== true &&
+    (!item.decide || item.decide.options.includes(item.decision.choice)));
+  for (const item of inboxItems) if (item.decide && !admittedDecision(item)) approvals.add(item.id);
+  for (const item of req.state?.inboxDecisions ?? []) if (item.ackedTs !== undefined && !admittedDecision(item)) approvals.add(item.id);
   return {
     authoritative: Boolean(tree.available && tree.ok && req.state?.taskUpdateOutbox?.ok !== false && sessionFile &&
-      !loaded.corrupt && !ledger?.corrupt && !ledger?.writeError && !req.state?.convergenceError && !completions.error && convState),
+      !loaded.corrupt && !ledger?.corrupt && !ledger?.writeError && !routeBroken && !req.state?.convergenceError && !completions.error && convState),
     taskProblems: tasks ? convergence.taskClosureProblems(tasks) : ["authoritative task tree unavailable"],
     liveChildren: liveIds.size,
     pendingAsks: asks.size,
@@ -2493,7 +2546,8 @@ function p7RepairDecision(req, service, state, answers) {
       body: `NOT completed. Verifier report: ${reportRef}\nFindings:\n${findings.map((finding) => `- ${finding}`).join("\n")}`});
   }
   if (choice.startsWith("apply:")) {
-    const offer = completionRows(req).rows.find((row) => row.status === "offered" && completionDecisions.isPendingCompletion(row));
+    const offer = completionRows(req).rows.find((row) => row.status === "offered" && completionDecisions.isPendingCompletion(row) &&
+      row.offer?.reportRef === reportRef);
     const optionId = choice.slice("apply:".length);
     if (!offer || !offer.offer.decisions.some((option) => option.id === optionId)) {
       return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}`, infrastructureIssue: true,
@@ -2520,6 +2574,10 @@ function p7RepairDecision(req, service, state, answers) {
       return escalateOnce(req, receipts, {key: `p7-repair:${ticketId}`, infrastructureIssue: true,
         title: "No admitted thinker slot for repair reasoning",
         body: `NOT completed. Verifier report: ${reportRef}\nFindings:\n${findings.map((finding) => `- ${finding}`).join("\n")}`});
+    }
+    // Spec §5: the recorded dispatch id makes replay a hold, never a re-think.
+    if (receipts.operations[`p7-repair:${ticketId}:dispatch_thinker`]?.effect) {
+      return {say: "Holding: the repair thinker dispatch is already recorded; replay cannot re-think.", calls: []};
     }
     const errors = [];
     persistClaim(req.agent.sessionFile, freshReceipts(req.agent.sessionFile), {v: 1, seq: 0, ts: Date.now(),
@@ -2548,7 +2606,7 @@ function p7SynthesisCorrection(req, service, state, answers) {
   if (choice !== "corrected_synthesis") {
     return escalateOnce(req, receipts, {key: `p7-synthesis-correction:${ticketId}`,
       title: `Synthesis coverage (${ticketId}) needs correction or escalation`,
-      body: `NOT completed. Prior synthesis report: ${state.synthesisProblems ? `${prior?.reportRef ?? "(none)"}` : "(none)"}\nCoverage problems:\n${(state.synthesisProblems ?? []).map((problem) => `- ${problem}`).join("\n")}`});
+      body: `NOT completed. Prior synthesis report: ${prior?.reportRef ?? "(none)"}\nCoverage problems:\n${(state.synthesisProblems ?? []).map((problem) => `- ${problem}`).join("\n")}`});
   }
   const readiness = p7Readiness(req, service.read(), {corrupt: false, writeError: null});
   const fresh = service.read();
@@ -2586,9 +2644,13 @@ export function p7ConvergenceAction(req, answers) {
   }
   const next = convergence.convergenceNext(state);
   if (next.kind === "escalate") {
-    const prior = Object.keys(receipts.operations).some((id) =>
-      id.startsWith("escalation:p7-") && receipts.operations[id].acknowledgement && !receipts.operations[id].acknowledgement.isError);
-    if (prior || escalationSent(req.events, "p7-failure", receipts)) {
+    // Spec §5: only the §3 admission/crash path's recorded key for THIS failure
+    // (the failed ticket's own escalation) may be reused; any other acknowledged
+    // p7-* escalation does not suppress the single stable-key p7-failure emit.
+    const failedKeys = state.tickets.filter((ticket) => ticket.status === "failed").flatMap((ticket) =>
+      [`escalation:p7-${ticket.kind}-${ticket.id}`, `escalation:p7-launch-${ticket.id}`]);
+    const recorded = failedKeys.some((key) => receipts.operations[key]?.acknowledgement);
+    if (recorded || escalationSent(req.events, "p7-failure", receipts)) {
       return {say: "Holding: the P7 failure escalation is already recorded.", calls: []};
     }
     return escalateAction(req, {key: "p7-failure", infrastructureIssue: true,
