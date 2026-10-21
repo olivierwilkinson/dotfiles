@@ -1,3 +1,4 @@
+model: decision/jev
 ---
 thinkingLevel: low
 system-prompt: append
