@@ -1369,18 +1369,19 @@ export function mapAnswers(answers, req) {
     return escalateAction(req, {key, infrastructureIssue: true, title: "P5 extension/bridge pair required",
       body: "NOT completed. jev-bridge v5 requires the paired extension's expectedTaskRevision task-bound completion CAS and state.inboxDecisions projection. Reload both together before resuming P5 decisions."});
   }
-  // Re-upsert the SAME key when a root row was dismissed without deciding.
-  // The production upsert clears its ack; the next full-session projection
-  // then stops reopening it. Dismissal itself never authorizes release.
+  // Re-upsert the SAME key after dismissal or any non-resuming answer.
+  // The production upsert clears its ack/decision; the next full-session
+  // projection then stops reopening it. Only explicit RESUME authorizes release.
   const unsentHold = statusHolds.find((hold) => !escalationSent(req.events, hold.key, receipts) ||
     (req.tools.some((tool) => tool.name === "escalate") && req.state?.inboxDecisions?.some((item) =>
-      item.id === `infra-${hold.key}` && item.ackedTs !== undefined && !item.decision)));
+      item.id === `infra-${hold.key}` && item.ackedTs !== undefined &&
+      !(item.decision?.choice === RESUME_RECONCILIATION && item.decision.other === false))));
   if (unsentHold) {
     const problem = `NOT completed. ${unsentHold.operationId}: ${unsentHold.error}. Reserved tasks cannot dispatch and convergence is held. `;
     return escalateAction(req, {key: unsentHold.key, infrastructureIssue: true,
       title: "Task reconciliation needs recovery",
       body: problem + `After checking the task receipts, choose "${RESUME_RECONCILIATION}" in the Inbox decision (not dismiss), ` +
-        `or revise every reserved task to authorize new work. Dismissal reopens this same row on the next decision, including after reload. This releases decisions, not task completion.`,
+        `or revise every reserved task to authorize new work. Dismissal or a non-resuming answer (including Other) reopens this same row on the next decision, including after reload. This releases decisions, not task completion.`,
       parentBody: problem + "After checking the task receipts, answer this linked subagent_ask_parent request directly, or revise every reserved task to authorize new work. Forwarding it into your own Inbox does not answer this ask. This releases decisions, not task completion.",
       decide: {question: "Have the authoritative task receipts been reconciled?", options: [RESUME_RECONCILIATION]}});
   }
