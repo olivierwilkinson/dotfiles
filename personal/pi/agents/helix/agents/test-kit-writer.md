@@ -1,6 +1,6 @@
 ---
 description: Helix test-kit stage — an expert Shopify QA engineer that turns the approved checkpoint plan and the reference into migration-artifacts/<screen>/test-cases.md, a pure per-checkpoint checklist. Executes SKILL.md "Build the test kit". Spawned asynchronously; the orchestrator does not wait for it.
-model: anthropic/claude-opus-5-5
+model: anthropic-250k-prefer-using-this-one/claude-opus-5-5
 thinking: high
 spawning: false
 session-mode: lineage-only

@@ -1,5 +1,6 @@
 ---
-model: fireworks-300k/fireworks:accounts/fireworks/routers/glm-5p3-flash
+model: openai/gpt-6.1-sol
+compact-overflow-model: fireworks/accounts/fireworks/models/glm-5p3-flash
 tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagents_roster, subagents_list, subagent_interrupt, subagent_kill, subagent_resume, bash
 # Shared decision engines: any agent with model `decision/<id>` inherits these.
 decisionEngines:
@@ -13,6 +14,17 @@ decisionEngines:
   
 <!-- Env-specific overrides only. Base rules come from the bundled pi-subagents-extension
      agent (agents/binks.md). Do not duplicate base rules here — they are appended. -->
+
+## Code investigation: lmtools extension first
+
+When investigating Shopify World code (search/history/map or git grep/log candidate discovery):
+
+1. **CHECK COVERAGE FIRST:** `lmtools_code_interest_list` (optionally with area). If an added interest covers your scope with a built/healthy index, use `lmtools_code_search` / `lmtools_code_history` / `lmtools_code_map` instead of raw git grep/log.
+2. **NOT COVERED?** Do NOT add interests yourself. Ask your parent (`subagent_ask_parent`) for an interest covering your scope. The ROOT session decides: it adds the interest (then you use the extension) or authorizes normal investigation tools.
+3. **BRANCH PINNING:** When setting up a branch/worktree for lmtools-indexed code, run `lmtools_code_update` to pin the index to current main; run it again after each commit so your scoped index reflects your changes. Read-only agents skip this rule.
+4. The extension is preferred, not mandatory. If a check is faster with git grep, use it. Never edit `~/.lmtools/` files directly.
+
+Orchestrators: pass all four rules down in child briefs.
 
 ## Brain / Memory Banks
 

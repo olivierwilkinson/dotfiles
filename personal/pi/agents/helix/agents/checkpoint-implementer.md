@@ -1,6 +1,6 @@
 ---
 description: Helix implementation stage — preps Setup 1–3 (proposes branch/base, identifies the reference, enumerates scope decisions), then in a separate invocation after the branch/scope approvals and helix's report that device-setup VERIFY completed verification, persistent session creation, and CLI login on the confirmed devices drafts checkpoints.md, then per checkpoint implements ViewModels, tests and UI, builds, applies review and device-gate fixes, prunes ui-review artifacts, and commits after approval. Executes SKILL.md Setup 1–3 prep, Plan checkpoints, and Implement steps 1–5, 8 pre-work, and 9.
-model: anthropic/claude-opus-5-5
+model: anthropic-250k-prefer-using-this-one/claude-opus-5-5
 thinking: high
 spawning: false
 session-mode: lineage-only

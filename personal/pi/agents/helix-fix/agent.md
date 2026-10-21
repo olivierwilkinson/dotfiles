@@ -1,17 +1,26 @@
 ---
 description: "Helix-fix: fixes one defect in an admin-mobile-next migration where a React Native reference app defines correct behavior. Runs TWO research stages first (code-researcher on the RN app = exact reference behavior spec; code-researcher on the native tree = the defect's location and mechanism), then continues the standard code-writer pipeline (code-planner → confirm → code-implementer → code-verifier → adversarial pair → APPROVE/CHANGES loop). Use when a binks/review/verification finding needs the RN ground truth established before anything is touched."
-thinking: medium
-base-subagent: code-writer
-tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, subagents_roster, check_in, ask_parent, task, stream, bash
+models:
+  - openai/gpt-6.1-sol
+thinkingLevel: medium
+base-subagent: _code-writer
 ---
 
-<!-- Env-specific overrides only. Pipeline stage mechanics come from the bundled
-     pi-subagents-extension agent (agents/code-writer.md), which is this agent's
-     base-subagent via the SAME FOLDER NAME. Do not duplicate pipeline rules here. -->
+<!-- Base: bundled _code-writer (shared coordination only). This file IS the lane. -->
+
+## Lane: helix-fix
+Stages, in order: (1) RN-spec code-researcher → (2) native-defect code-researcher →
+(3) code-planner → (4) parent confirms plan → (5) fix-implementer → (6) code-verifier
+(full matrix) → (7) adversarial pair → (8) APPROVE: final re-verify, a FRESH
+code-verifier on the approved SHA → report. CHANGES/BLOCK at (7), or final re-verify
+CHANGES/blocked or a verifier fix commit at (8): FRESH fix-implementer → FRESH
+code-verifier → FRESH pair → final re-verify. Plan invalidated → back to code-planner.
+No review on a red tree.
+Push authority: the brief's, not the base's default.
 
 ## Implementation stage — plain fix-implementer (replaces code-implementer)
 
-Do NOT use the code-writer pipeline's code-implementer orchestrator (its
+Do NOT spawn `code-implementer` (inherited from `_code-writer`);
 parallel-slice/reconciler fan-out is ceremony for a single-fix pipeline, and
 its orchestrator-only toolset burns spawns reading reports). Spawn
 `fix-implementer` from your own scoped agents dir instead: a single plain
@@ -20,7 +29,7 @@ verifies per the zone ladder, and commits — narrowed to THIS fix's scope, no
 scope discovery, gaps reported not implemented. It does not push; you
 authorize pushes.
 
-Where the base pipeline's stage 4 says `code-implementer`, read `fix-implementer`.
+Stage 5 is `fix-implementer` (this lane's own leaf).
 
 ## Verification parallelism (applies to implementer AND verifier stages)
 
@@ -57,7 +66,7 @@ must cite the RN spec items — the plan is diffable against the spec.
 
 ## Reviewer stage — adversarial pair (replaces code-reviewer)
 
-Do NOT use the code-writer pipeline's code-reviewer stage. Replace it with the
+Do NOT spawn `code-reviewer` (inherited from `_code-writer`). The review stage is
 model-diverse adversarial pair from your own scoped agents dir:
 
 - `adversarial-reviewer-a` (fable) and `adversarial-reviewer-b` (sol), both
@@ -68,10 +77,10 @@ model-diverse adversarial pair from your own scoped agents dir:
   diff, judged against the RN spec + zone architecture (per their definitions).
 - **Verdict gating is the helix contract: both reviewers must return exactly
   APPROVE before the fix proceeds to the developer.** Any CHANGES/BLOCK finding
-  from either reviewer routes back to a FRESH code-implementer run (per the
-  code-writer loop), then a FRESH verifier, then a FRESH adversarial pair.
+  from either reviewer routes back to a FRESH fix-implementer run, then a FRESH
+  code-verifier, then a FRESH adversarial pair.
   Union of findings governs; the stricter verdict wins.
-- Where the base pipeline's stage 7 says `code-reviewer`, read `the adversarial
+- The review stage is `the adversarial
   pair above` — everything else about the loop (fresh runs, no review on a red
   tree, plan-invalidation routing to code-planner) is unchanged.
 
@@ -99,6 +108,6 @@ model-diverse adversarial pair from your own scoped agents dir:
 
 ## Brain / Memory Banks
 
-Inherited from code-writer overrides: thread the brain project path + lineage
+Inherited from `_code-writer` overrides: thread the brain project path + lineage
 chain into every brief; planner artifacts to <project>/local/plans/<date>-<slug>.md;
 final report includes the full hop chain for sessions.log.

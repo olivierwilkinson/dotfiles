@@ -1,5 +1,5 @@
 ---
-model: anthropic/claude-opus-5-5
+model: openai/gpt-6.1-sol
 thinking: high
 system-prompt: append
 ---

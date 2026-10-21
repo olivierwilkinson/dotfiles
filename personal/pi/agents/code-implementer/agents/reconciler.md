@@ -1,7 +1,7 @@
 ---
 system-prompt: append
+model: openai/gpt-6.1-sol
 ---
-model: anthropic/claude-opus-5-5
 
 <!-- Env-specific overrides only. Base rules come from the bundled pi-subagents-extension
      agent (agents/code-implementer/reconciler.md) and are appended. -->

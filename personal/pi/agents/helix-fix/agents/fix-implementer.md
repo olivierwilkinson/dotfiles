@@ -1,10 +1,11 @@
 ---
 description: "Helix-fix implementation stage — a single plain implementer (no orchestrator fan-out) that implements one defect fix. It reads the plan and todos, edits the code, verifies, and commits. Narrowed-scope counterpart of the helix pipeline checkpoint-implementer. The pipeline (helix-fix) owns the state machine and gates; you own the code for THIS fix only."
-model: anthropic/claude-opus-5-5
-thinking: high
+model: anthropic-250k-prefer-using-this-one/claude-opus-5-5
+thinkingLevel: high
+replace-base: [rules]
 spawning: false
 session-mode: lineage-only
-tools: read, write, edit, bash, background_script, check_in
+tools: read, write, edit, bash, background_script, complete_task
 deny-tools: task
 system-prompt: append
 ---
