@@ -2468,11 +2468,19 @@ export function p7Readiness(req, convState, ledger) {
     if (row.purpose === "status_scout" && liveStates.includes(row.state)) statusScouts.add(row.spawnSlot ?? row.childId);
   }
   const approvals = new Set();
-  // Spec §4: only a decision admitted as one of the offered finite options and
-  // durably recorded releases the gate; a free-text/unoffered decision or an
-  // ack/dismissal alone cannot release it.
+  // Spec §4: an Inbox `decide` row releases only when its decision has been
+  // admitted as one of the offered finite options AND durably applied by
+  // P3/P5 — the durable reconciled receipt statusFaultHolds writes for the
+  // key-bound row (`infra-${reconciled.detail.key}`). A recorded decision shape
+  // without that receipt still blocks; a free-text/unoffered decision and an
+  // ack/dismissal alone can never release the gate.
+  const reconciledInboxIds = new Set();
+  for (const operation of Object.values(receipts.operations)) {
+    const key = operation?.reconciled?.detail?.key;
+    if (typeof key === "string") reconciledInboxIds.add(`infra-${key}`);
+  }
   const admittedDecision = (item) => Boolean(item.decision && item.decision.other !== true &&
-    (!item.decide || item.decide.options.includes(item.decision.choice)));
+    (!item.decide || item.decide.options.includes(item.decision.choice)) && reconciledInboxIds.has(item.id));
   for (const item of inboxItems) if (item.decide && !admittedDecision(item)) approvals.add(item.id);
   for (const item of req.state?.inboxDecisions ?? []) if (item.ackedTs !== undefined && !admittedDecision(item)) approvals.add(item.id);
   return {

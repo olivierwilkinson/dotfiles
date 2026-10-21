@@ -1094,7 +1094,7 @@ describe("bridge P7 convergence (v7)", () => {
     assert.match(replay.mapped.say, /already recorded|cannot re-think/);
   });
 
-  it("case 16: free-text/unoffered decisions cannot release the approval gate; an admitted finite-option decision can", (t) => {
+  it("case 16: free-text/unadmitted decisions cannot release the approval gate; only an admitted decision durably applied by P5 can", (t) => {
     const fx = p7Fixture(t);
     p7CompleteWorkRun(fx);
     const blockers = () => p7Drive(fx.req, {done: {noul: 0.98}, next_action: {choice: "report_done"}});
@@ -1107,10 +1107,18 @@ describe("bridge P7 convergence (v7)", () => {
     // An unoffered choice recorded as a real option does not release it either.
     appendEntry(fx.sessionFile, item({choice: "maybe", other: false, ts: 3}));
     assert.deepEqual(blockers().mapped.calls, [], "an unoffered choice cannot release the approval gate");
-    // An admitted finite-option decision, durably recorded, releases it.
+    // An admitted finite-option decision shape WITHOUT the durable P5
+    // reconciled receipt still blocks: shape alone is not durable application.
     appendEntry(fx.sessionFile, item({choice: "ship", other: false, ts: 4}));
+    assert.deepEqual(blockers().mapped.calls, [], "an admitted decision shape without the durable P5 receipt blocks");
+    // The same decision with the durable P5 reconciled receipt (the
+    // statusFaultHolds application claim for key "key-2") releases the gate.
+    const receipts = readOrchReceipts(fx.sessionFile).receipts;
+    receipts.operations["status-fault:sf-2"] = {reconciled: {phase: "reconciled",
+      detail: {disposition: "inbox-decided", key: "key-2"}}};
+    assert.equal(saveOrchReceipts(fx.sessionFile, structuredClone(receipts)).ok, true);
     const released = blockers();
-    assert.equal(released.mapped.calls[0]?.tool, "subagent", "an admitted finite-option decision releases the gate");
+    assert.equal(released.mapped.calls[0]?.tool, "subagent", "an admitted decision with the durable P5 reconciled receipt releases the gate");
   });
 
   it("case 17: the repair apply-branch re-matches the persisted offer's reportRef against the verifier ticket", (t) => {
