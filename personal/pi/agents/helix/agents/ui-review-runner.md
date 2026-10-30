@@ -2,7 +2,7 @@
 description: Helix device-gate stage — owns the persistent Agent Device sessions, executes each checkpoint's test-cases.md sweep against the reference, captures the visual-gate screenshots, and runs the mandatory agent-scripts/ui-review gate per platform. Executes SKILL.md step 6; closes both sessions at the end of the migration.
 spawning: false
 session-mode: lineage-only
-tools: read, write, edit, bash, background_script, check_in
+tools: read, write, edit, bash, background_script
 deny-tools: task
 system-prompt: append
 ---

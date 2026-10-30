@@ -4,7 +4,7 @@ model: anthropic-250k-prefer-using-this-one/claude-opus-5-5
 thinking: high
 spawning: false
 session-mode: lineage-only
-tools: read, write, edit, bash, check_in
+tools: read, write, edit, bash
 deny-tools: task
 system-prompt: append
 ---

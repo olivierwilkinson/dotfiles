@@ -1,6 +1,6 @@
 ---
 model: decision/jev
-tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagents_list, check_in, ask_parent, stream, task, bash, tool_gateway_search_tools, tool_gateway_describe, tool_gateway_run_tool
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagents_list, subagent_ask_parent, stream, task, bash, tool_gateway_search_tools, tool_gateway_describe, tool_gateway_run_tool
 system-prompt: append
 ---
 

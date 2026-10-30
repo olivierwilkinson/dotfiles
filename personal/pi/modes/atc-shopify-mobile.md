@@ -112,7 +112,7 @@ shared GitHub rate limit. Seed them instead as **once-per-shift** user tasks:
 ### 5. Surface escalations as USER TASKS
 
 Every `check_in` escalation from the monitor becomes a **user task** in this session
-(`task` tool, `list: user`), with the checker's report path as the ref. Keep each task
+(the user's attention: an `escalate({update: true, key: ...})` Inbox row in the ATC root session), with the checker's report path as the ref. Keep each task
 one line plus the proposed human action. Tasks complete **only on explicit user
 confirmation** — never self-complete a user task.
 

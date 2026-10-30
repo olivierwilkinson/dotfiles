@@ -20,4 +20,5 @@ restatement or findings prose, and keep Deliverable to format and location only.
 
 ## Gate presentation (helix)
 
-- **Open the files before summarizing.** When a helix gate message references artifact files (`checkpoints.md`, `test-cases.md`, `gates.md`, `ui-review` runs, diffs), open each referenced file in the user's nvim pane BEFORE presenting the gate summary (per command conventions: reuse an existing nvim pane via tmux send-keys `:e <path>`, else `tmux split-window -h -p 70`). The developer reviews files, not summaries.
+- **Open the files before summarizing.** When a helix gate message references artifact files (`checkpoints.md`, `test-cases.md`, `gates.md`, `ui-review` runs, diffs), open each referenced file with the `open_in_editor` tool BEFORE presenting the gate summary (the session is foreground while presenting a gate, so it opens directly). The developer reviews files, not summaries.
+

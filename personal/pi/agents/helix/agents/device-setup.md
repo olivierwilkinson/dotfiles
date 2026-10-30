@@ -2,7 +2,7 @@
 description: Helix device-setup stage — runs in two invocations split by the device-confirmation gate. DISCOVER lists booted devices and reports them (no verification, no sessions, no login); after the developer's device selection/reference-app confirmation, VERIFY resumes the same instance to verify both apps are installed and logged in, create the persistent per-platform Agent Device sessions, and complete CLI login. Executes SKILL.md Setup steps 4–5.
 spawning: false
 session-mode: lineage-only
-tools: read, bash, check_in
+tools: read, bash
 deny-tools: task
 system-prompt: append
 ---

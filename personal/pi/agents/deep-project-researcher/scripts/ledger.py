@@ -19,8 +19,13 @@ import sys
 import tempfile
 import time
 
-ROLES = {"scope": 1, "decomposition": 1, "context": 1, "facet": 10,
-         "synthesis": 2, "joint": 1}
+# Second scope admission is reserved for parent-directed revision cycles
+# (e.g. a pipeline change requiring the assembler to re-derive its interests
+# manifest); the normal flow still admits scope exactly once.
+ROLES = {"scope": 2, "decomposition": 1, "vault": None, "slack": None,
+         "code_sweep": None, "facet": None, "enumerate": None, "synthesis": 2,
+         "joint": 1, "think": 3}
+LOOP_ROLES = {"vault", "slack", "code_sweep", "facet", "enumerate"}
 MAX_SESSION_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 
@@ -198,19 +203,31 @@ class Ledger:
                 self.owner(state, actor)
                 role, key = args["role"], args["key"]
                 lease = money(args["lease_usd"])
+                phase = args.get("loop_phase")
                 if role not in ROLES or not 0 < lease <= 10 or not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", key):
                     raise ValueError("invalid role, ticket key or lease (0 < USD <= 10)")
+                if role in LOOP_ROLES and phase not in ("scoping", "deep"):
+                    raise ValueError("loop roles require loop_phase scoping|deep")
+                if role not in LOOP_ROLES and phase is not None:
+                    raise ValueError("loop_phase is only valid for loop roles")
+                if role == "code_sweep" and phase != "scoping":
+                    raise ValueError("code_sweep is scoping-phase only")
+                if role == "facet" and phase != "deep":
+                    raise ValueError("facet loops are deep-phase only")
+                if role == "enumerate" and phase != "deep":
+                    raise ValueError("enumerate loops are deep-phase only")
                 old = state["admissions"].get(key)
                 if old:
-                    if old["role"] != role or money(old["leaseUsd"]) != lease:
+                    if old["role"] != role or money(old["leaseUsd"]) != lease or old.get("phase") != phase:
                         raise ValueError("ticket identity conflict")
                     response.update(ticket=key, replay=True)
                 elif state["pendingGate"]:
                     response.update(ok=False, reason="cost_gate_pending")
-                elif role != "scope" and (not state["scope"] or not state["scope"]["approved"] or
-                                           state["scope"]["digest"] != args.get("scope_digest")):
+                elif role != "scope" and not (role in LOOP_ROLES and phase == "scoping") and \
+                        (not state["scope"] or not state["scope"]["approved"] or
+                         state["scope"]["digest"] != args.get("scope_digest")):
                     response.update(ok=False, reason="scope_not_approved")
-                elif sum(a["role"] == role for a in state["admissions"].values()) >= ROLES[role]:
+                elif ROLES[role] is not None and sum(a["role"] == role for a in state["admissions"].values()) >= ROLES[role]:
                     response.update(ok=False, reason="role_lifetime_cap")
                 elif sum(not a["settled"] for a in state["admissions"].values()) >= 3:
                     response.update(ok=False, reason="concurrency_cap")
@@ -218,7 +235,8 @@ class Ledger:
                     response.update(ok=False, reason="lease_headroom", hint="reduce lease or request early cost gate")
                 else:
                     state["admissions"][key] = {"role": role, "leaseUsd": str(lease), "session": None,
-                                                "scopeDigest": args.get("scope_digest"), "settled": False}
+                                                "scopeDigest": args.get("scope_digest"), "phase": phase,
+                                                "settled": False}
                     response["ticket"] = key
             elif op == "settle":
                 key = args["key"]
@@ -240,7 +258,7 @@ class Ledger:
             scope_valid = True
             if mine["ticket"] != "coordinator":
                 admission = state["admissions"][mine["ticket"]]
-                if admission["role"] != "scope":
+                if admission["role"] != "scope" and admission.get("phase") != "scoping":
                     scope_valid = bool(state["scope"] and state["scope"]["approved"] and
                                        state["scope"]["digest"] == admission["scopeDigest"])
             response.update(runId=state["runId"], usedUsd=str(used),
@@ -277,6 +295,7 @@ def main():
     p.add_argument("--run-id")
     p.add_argument("--key")
     p.add_argument("--role", choices=list(ROLES))
+    p.add_argument("--loop-phase", choices=["scoping", "deep"])
     p.add_argument("--lease-usd", type=str)
     p.add_argument("--scope-file")
     p.add_argument("--scope-digest")

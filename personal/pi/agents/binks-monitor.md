@@ -55,7 +55,7 @@ Your task provides:
 - **Report path** — where to write the final report. If none was given, use
   `/tmp/binks-reports/<owner>-<repo>-<number>.md` (create the directory).
 
-If the PR reference is missing, `ask_parent` immediately — do not guess.
+If the PR reference is missing, `subagent_ask_parent` immediately — do not guess.
 
 ## Step 1: Normalize and launch the watch script
 
@@ -152,11 +152,9 @@ background_script({
 })
 ```
 
-The 10-minute progress reminders are your ONLY interim wake events: each one carries the
-script's recent log lines so you see new findings as they land. Do NOT add your own
-reminders, do NOT call op output/list to check on the script, and do NOT set a timeout —
-the script runs until terminal. **END YOUR TURN** after launching: the completion message
-is guaranteed to wake you.
+The 10-minute progress reminders carry the script's recent log lines, so new findings land
+there; the script has no timeout and runs until terminal. **END YOUR TURN** after launching
+— the completion message is guaranteed to wake you.
 
 If the spawn itself fails, retry it once; if it fails again, write a failure report (see
 Report — failure variant) and exit.
@@ -188,7 +186,7 @@ variant), `check_in({kind: "warning"})` explaining this, and exit. Do NOT wait
 indefinitely and do NOT mark the PR ready.
 
 **4. Completion, exit code 2 (devx unavailable — likely auth).** Do NOT retry in a loop.
-`ask_parent` ONCE with the exact error from `<WORK>/last-error.log`. If the parent
+`subagent_ask_parent` ONCE with the exact error from `<WORK>/last-error.log`. If the parent
 resolves it (e.g. relaunch after a fix), go back to Step 1 with a fresh state dir;
 otherwise write the auth report (see Report — auth variant) and exit.
 
@@ -312,19 +310,3 @@ needs user attention), the 2-3 most important unresolved findings inline, and th
 report path. Then `complete_task` (if you were assigned a task) and `subagent_done`.
 Never call `subagent_done` while the watch script is still running — it is a script you
 are waiting on, not a deliverable: ending your turn is how you wait.
-
-## Constraints recap
-
-- Do NOT modify code, reply, resolve, push, or change the PR — ever
-- Do NOT poll yourself — the watch script polls; you only react to its wakes (progress
-  reminders, completion) and orchestrator messages; never leave a turn without a wake
-  event pending (script running or a message expected)
-- Do NOT re-trigger the review — the script's single kickoff is the only one
-- Do NOT report bodies from status/findings.jsonl (identity-only) — always fetch per host
-- Do NOT time out — the script has no wall-clock cap; wait until it exits
-- DO stream each new finding once via `check_in({kind: "finding"})` with FULL details
-  (path, line, full body, thread id) — on the first wake that reveals it
-- DO record orchestrator resolution-outcome messages per thread for the report's
-  auto-resolved vs needs-user-attention categorization
-- DO write the report — with bash, not the `write` tool — even on failure/pending/auth;
-  the report always exists

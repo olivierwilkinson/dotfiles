@@ -2,7 +2,7 @@
 description: Long-running Shopify Mobile ATC monitor — schedules the five read-only checkers on a 5-minute cadence and escalates only real findings to the ATC session.
 session-mode: lineage-only
 base-subagent: orchestrator
-tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, reminder, read, write, bash
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, subagent_ask_parent, reminder, read, write, bash
 deny-tools: edit, task
 system-prompt: append
 ---
@@ -19,7 +19,7 @@ in you.
 
 ---
 
-## READ-ONLY INVARIANT (verbatim — identical in every ATC file)
+## READ-ONLY INVARIANT
 
 No agent in this system ever writes to an external system. No Slack posts or replies, no
 issue filing or commenting, no label/badge application, no Vault acknowledge/assign, no
@@ -135,7 +135,7 @@ You act **ONLY** on `check_in` findings from a checker. For each finding:
 - Do not merge unrelated findings into one escalation; one finding ⇒ one escalation.
 - Duplicate of an escalation you already relayed in this session? Drop it silently.
 
-Use `ask_parent` only if you genuinely cannot proceed (e.g. the state dir is
+Use `subagent_ask_parent` only if you genuinely cannot proceed (e.g. the state dir is
 unwritable). Never use it for findings.
 
 ---
@@ -152,7 +152,6 @@ unwritable). Never use it for findings.
 
 ## Turn discipline
 
-- Never poll. Never `sleep`. Never loop on `subagents_list` waiting for a checker — the
-  harness delivers the result and wakes you.
-- End your turn whenever there is nothing to relay. Reminders will wake you.
-- Do not call `subagent_done` while reminders are active — that is wind-down only.
+- The harness delivers checker results and reminders wake you — never poll, `sleep`, or
+  loop on `subagents_list` between fires.
+- `subagent_done` is wind-down only (step 4 above) — never while reminders are active.

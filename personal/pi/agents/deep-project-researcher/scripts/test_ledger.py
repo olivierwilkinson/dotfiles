@@ -41,7 +41,9 @@ class LedgerTests(unittest.TestCase):
         return self.ledger.run(op, self.coordinator, **args)
 
     def admit(self, key="facet-1", role="facet", lease=5):
-        return self.call("admit", key=key, role=role, lease_usd=lease, scope_digest=self.hash)
+        phase = "deep" if role in ("facet", "enumerate") else None
+        return self.call("admit", key=key, role=role, lease_usd=lease,
+                         scope_digest=self.hash, loop_phase=phase)
 
     def test_deep_requires_scope_gate(self):
         self.call("scope", scope_file=str(self.scope))
@@ -206,6 +208,76 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse(self.admit()["ok"])
         result = self.call("approve-cost", threshold=100, approval_ref="parent:early-100")
         self.assertEqual(result["nextThresholdUsd"], 200)
+
+    def test_loop_roles_phase_gated_and_budget_bound(self):
+        path = self.root / "runs/run2.json"
+        ledger2 = Ledger(path, self.sessions)
+        ledger2.init("run2", self.coordinator)
+        call = lambda op, **a: ledger2.run(op, self.coordinator, **a)
+        # scoping loop admission needs no approved scope artifact
+        self.assertTrue(call("admit", key="vault-s1-i1", role="vault", lease_usd=5,
+                             loop_phase="scoping")["ok"])
+        # a scoping-phase leaf may retrieve without an approved scope
+        leaf = self.session("vaultleaf", 0.5)
+        self.assertTrue(ledger2.register("vault-s1-i1", leaf)["mayRetrieve"])
+        # loop roles require loop_phase; other roles reject it
+        with self.assertRaisesRegex(ValueError, "loop_phase"):
+            call("admit", key="vault-s1-i2", role="vault", lease_usd=5)
+        with self.assertRaisesRegex(ValueError, "loop_phase"):
+            call("admit", key="j1", role="joint", lease_usd=5, loop_phase="scoping",
+                 scope_digest="x")
+        # role/phase pairing: code_sweep scoping-only, facet deep-only
+        with self.assertRaisesRegex(ValueError, "scoping-phase only"):
+            call("admit", key="sweep-s2-i1", role="code_sweep", lease_usd=5,
+                 loop_phase="deep")
+        with self.assertRaisesRegex(ValueError, "deep-phase only"):
+            call("admit", key="facet-s1-i1", role="facet", lease_usd=5,
+                 loop_phase="scoping", scope_digest="x")
+        # enumerate: loop role, deep-phase only, no numeric lifetime cap
+        with self.assertRaisesRegex(ValueError, "loop_phase"):
+            call("admit", key="enum-k1-i1", role="enumerate", lease_usd=3)
+        with self.assertRaisesRegex(ValueError, "deep-phase only"):
+            call("admit", key="enum-k1-i1", role="enumerate", lease_usd=3,
+                 loop_phase="scoping", scope_digest="x")
+        # deep-phase loop admission still requires the approved scope
+        result = call("admit", key="vault-s2-i1", role="vault", lease_usd=5, loop_phase="deep")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "scope_not_approved")
+        # loop roles have no numeric lifetime cap: settled iterations readmit freely
+        call("settle", key="vault-s1-i1", completion_ref="report:1")
+        for i in range(2, 12):
+            self.assertTrue(call("admit", key=f"vault-s1-i{i}", role="vault", lease_usd=1,
+                                 loop_phase="scoping")["ok"])
+            call("settle", key=f"vault-s1-i{i}", completion_ref=f"report:{i}")
+        self.assertEqual(sum(a["role"] == "vault" for a in
+                             json.loads(path.read_text())["admissions"].values()), 11)
+
+    def test_facet_loop_admissions_are_budget_bound(self):
+        for i in range(1, 8):
+            self.assertTrue(self.admit(f"facet-c1-i{i}")["ok"])
+            self.call("settle", key=f"facet-c1-i{i}", completion_ref=f"report:{i}")
+        state = json.loads((self.root / "runs/run.json").read_text())
+        self.assertEqual(sum(a["role"] == "facet" for a in
+                             state["admissions"].values()), 7)
+
+    def test_enumerate_loops_deep_only_and_uncapped(self):
+        # deep-phase happy path, no numeric lifetime cap, many cells at once
+        for cell in ("k1", "k2"):
+            for i in range(1, 6):
+                self.assertTrue(self.admit(f"enum-{cell}-i{i}", role="enumerate", lease=2)["ok"])
+                self.call("settle", key=f"enum-{cell}-i{i}", completion_ref=f"r:{cell}:{i}")
+        state = json.loads((self.root / "runs/run.json").read_text())
+        self.assertEqual(sum(a["role"] == "enumerate" for a in
+                             state["admissions"].values()), 10)
+
+    def test_scope_allows_one_parent_directed_revision(self):
+        # (was dead code after the __main__ block with a bad base class; never ran)
+        self.assertTrue(self.admit("scope-1", "scope")["ok"])
+        self.assertTrue(self.admit("scope-2", "scope")["ok"])
+        third = self.admit("scope-3", "scope")
+        self.assertFalse(third["ok"])
+        self.assertEqual(third["reason"], "role_lifetime_cap")
+
 
 
 if __name__ == "__main__":

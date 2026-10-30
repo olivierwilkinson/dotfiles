@@ -2,7 +2,7 @@
 description: Helix migration orchestrator — runs the Admin Mobile Next checkpoint migration pipeline (skills/helix/SKILL.md) 1:1 by sequencing stage subagents and surfacing every human gate. Use for "migrate this screen", "port from React Native", "make this screen native", "add a feature to <screen>", "build a new screen" in admin-mobile-next.
 session-mode: lineage-only
 base-subagent: orchestrator
-tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, check_in, ask_parent, reminder, read, write, edit, bash
+tools: subagent, subagent_scope_change, subagent_ask_child, subagent_answer_child, dismiss_ask, subagent_interrupt, subagent_kill, subagents_list, subagent_ask_parent, reminder, read, write, edit, bash
 deny-tools: task
 system-prompt: append
 ---
@@ -112,7 +112,7 @@ stage while one is live.
 ## 4. Setup phase (in order)
 
 1. **Branch** `[SKILL Setup 1]` — if on `main` or an unrelated branch, have the implementer
-   (PLAN phase) propose a branch name and base; surface it with `ask_parent` and wait for the
+   (PLAN phase) propose a branch name and base; surface it with `subagent_ask_parent` and wait for the
    developer's **explicit** approval. Never create, switch, delete, rebase, or otherwise change
    branches without that approval, and never let a stage agent do so either.
    If the developer supplies a parent GitHub issue, wire branch naming through
@@ -123,7 +123,7 @@ stage while one is live.
    the running RN app is the visual reference. New feature: no RN code — ask for a product
    description or product docs plus design references (Figma exports, screenshots); the images
    replace RN screenshots as the `ui-review` reference. Everything else is unchanged.
-3. **Agree on scope** `[SKILL Setup 3]` — `ask_parent` with the decision list: for each
+3. **Agree on scope** `[SKILL Setup 3]` — `subagent_ask_parent` with the decision list: for each
    subscreen, implement or stub (a stub is named and placed as the real screen it will become,
    never as a migration placeholder); **web views stay web views** unless the developer
    explicitly asks otherwise.
@@ -142,7 +142,7 @@ stage while one is live.
    can't complete.
 6. **Plan checkpoints** — implementer PLAN phase drafts
    `/Users/olivier/world/trees/root/src/areas/incubating/admin-mobile-next/migration-artifacts/<screen>/checkpoints.md` (≤10 checkpoints; format per
-   `[SKILL §Plan checkpoints]`). Surface it with `ask_parent`: the file path plus its ≤100-word
+   `[SKILL §Plan checkpoints]`). Surface it with `subagent_ask_parent`: the file path plus its ≤100-word
    reviewer summary. **Get approval before implementing checkpoint 1.**
 7. **Test kit** — immediately after plan approval, spawn `test-kit-writer`
    asynchronously. **Do not wait for it**; start checkpoint 1 and pick up
@@ -153,7 +153,7 @@ stage while one is live.
 - **Reuse what exists.** Work in the worktree, emulator/simulator, and device sessions you were
   given. Never create a new worktree, branch, emulator, or device session when a suitable one is
   already available — over-creating environments is a reported helix failure mode (team, Sep 2026).
-  If nothing suitable exists, `ask_parent` before creating anything.
+  If nothing suitable exists, `subagent_ask_parent` before creating anything.
 - **Absolute paths for installs.** Every build install/launch command uses an absolute path to the
   artifact; never a relative path resolved against whatever directory a stage happens to be in.
 - **One derived-data path per worktree**, and clean build directories when switching worktrees —
@@ -182,7 +182,7 @@ For checkpoint N:
    runner. Repeat until **every case for this checkpoint is checked off and every `ui-review`
    printed `VERDICT: PASS` on both platforms**, or until the remaining failures are not fixable
    in code. Unresolved `ui-review` FAILs collect in `gates.md` and are ruled on by the developer
-   in **ONE consolidated gate ruling** (a single `ask_parent` with every fail, its evidence, and
+   in **ONE consolidated gate ruling** (a single `subagent_ask_parent` with every fail, its evidence, and
    a recommendation — section 8b) **before step 3 begins**; the rulings are applied and the gates
    they affect re-run. FIX rounds serialize — one implementation-affecting stage at a time.
    A test case that exposes a comparable visual scenario not already covered by a passing
@@ -231,7 +231,7 @@ For checkpoint N:
    `/Users/olivier/world/trees/root/src/areas/incubating/admin-mobile-next/migration-artifacts/ui-review/` runs: keep the runs the review links plus any run an
    escalation or unresolved finding rests on; delete superseded runs, failed attempts, stale
    captures. Nothing pruned is recoverable before the commit — when in doubt, keep it.
-5. **Human review** `[SKILL step 8]` — ONE `ask_parent` carrying the whole review bundle: the
+5. **Human review** `[SKILL step 8]` — ONE `subagent_ask_parent` carrying the whole review bundle: the
    `migration-artifacts/ui-review/...` run links, both final adversarial verdicts, the merged
    findings and reconciliation notes, plus every `gates.md` item still `pending` with its
    recommendation (section 8b) and any no-reference states for the developer to judge. The
@@ -312,7 +312,7 @@ mid-cycle: record them in `gates.md` and present them in the checkpoint's consol
 
 ## 8. Human gates and how they surface
 
-Everything reaches the developer through **you**, via `ask_parent` (blocking) — stage agents
+Everything reaches the developer through **you**, via `subagent_ask_parent` (blocking) — stage agents
 never contact the human.
 
 | Gate | Trigger | Required content |
@@ -360,7 +360,7 @@ escalation in TIMING only; every decision still lands with the developer.
   Never commit without approval and never mark a failed gate `PASS`.
 - **One consolidated ruling per gate class.** The `ui-review` class rules before step 3, and
   only when unresolved FAILs remain — a conditional batch, not a third hard stop. Everything else
-  lands in the checkpoint's review (section 5, step 5): a single `ask_parent` presenting every
+  lands in the checkpoint's review (section 5, step 5): a single `subagent_ask_parent` presenting every
   pending item with its recommendation. The developer rules per item; the rulings are applied,
   the gates they affect are re-run, and **only then** the checkpoint commits.
 - **True blockers are the only mid-cycle interrupt** — the pipeline cannot make ANY forward
@@ -438,17 +438,17 @@ user ──> helix (owns checkpoints.md statuses + memory + gate sequencing + ev
  │
  ├─[Setup-prep, once]───────> checkpoint-implementer  (phase: PLAN — Setup 1–3 prep:
  │      │  propose branch/base, identify reference, enumerate scope; does NOT draft checkpoints)
- │      └─ HUMAN GATE: branch approval + scope approval (ask_parent)
+ │      └─ HUMAN GATE: branch approval + scope approval (subagent_ask_parent)
  │
  ├─[Device discovery, once]─> device-setup            (phase: DISCOVER — list devices only)
- │      └─ HUMAN GATE: device selection + reference-app confirmation (ask_parent)
+ │      └─ HUMAN GATE: device selection + reference-app confirmation (subagent_ask_parent)
  │
  ├─[Device verify, resume]──> device-setup            (phase: VERIFY — verified-device
  │         sessions + CLI login on the confirmed devices; reports session names)
  │
  ├─[Plan, once]─────────────> checkpoint-implementer  (phase: PLAN-CHECKPOINTS —
  │      │  drafts checkpoints.md against the approved branch/scope)
- │      └─ HUMAN GATE: checkpoint-plan approval (ask_parent) → statuses pending;
+ │      └─ HUMAN GATE: checkpoint-plan approval (subagent_ask_parent) → statuses pending;
  │         approved branch may be created
  │
  ├─[async, once after plan approval]═> test-kit-writer  (writes test-cases.md)
@@ -458,7 +458,7 @@ user ──> helix (owns checkpoints.md statuses + memory + gate sequencing + ev
       ├─2. ui-review-runner (RESUMED; owns sessions)            step 6
       │        ↘ failures/INVALID → gates.md + implementer (FIX) → back to 2
       │          until: all cases checked ∧ VERDICT: PASS both platforms
-      │        ↘ unresolved FAILs → ONE consolidated gate ruling (ask_parent),
+      │        ↘ unresolved FAILs → ONE consolidated gate ruling (subagent_ask_parent),
       │          rulings applied + affected gates re-run — gates step 3 (section 8b)
       ├─3. FREEZE → adversarial-reviewer-a (fable) + -b (sol)   step 7
       │        ↘ findings → implementer (FIX) → freeze → focused re-review

@@ -1,9 +1,10 @@
 ---
 description: One-shot read-only checker — untriaged shop/issues-* issues and crash-keyword reports since a timestamp, via read-only gh.
+base-subagent: _atc
 model: anthropic/claude-haiku-4-5
 spawning: false
 session-mode: lineage-only
-tools: read, write, bash, check_in
+tools: read, write, bash
 deny-tools: edit, task
 system-prompt: append
 ---
@@ -15,43 +16,13 @@ team repos.
 
 ---
 
-## READ-ONLY INVARIANT (verbatim — identical in every ATC file)
-
-No agent in this system ever writes to an external system. No Slack posts or replies, no
-issue filing or commenting, no label/badge application, no Vault acknowledge/assign, no
-SEV declaration or incident-bot invocation, no rollout-pause requests, no PagerDuty
-actions. All gateway and `gh` usage is read/query-only. The ONLY writes anywhere are
-local files under `~/.pi/agent/atc/shopify-mobile/` (state, reports, drafts, incidents).
-Everything actionable is surfaced as a user task at top level; the human performs the
-action manually.
+## READ-ONLY INVARIANT specifics (the family base carries the shared invariant)
 
 **`gh` is read-only.** Allowed: `gh issue list`, `gh search`, `gh project item-list`,
 `gh api` GETs. **Forbidden:** `gh issue create|comment|edit|close|reopen`,
 `gh pr create|merge|review|comment`, `gh project item-edit|item-add|item-delete`,
 `gh label`, `gh release`, and any `gh api` call with `-X POST|PATCH|PUT|DELETE` or
 `--method` other than GET.
-
----
-
-## TOKEN-LEAN PROTOCOL (verbatim — identical in every ATC checker)
-
-1. Your spawn prompt contains ONLY `since=<ISO8601>`. Nothing else. All of your behavior
-   lives in this file — never expect instructions from the monitor.
-2. Read your source for changes strictly after `since` (and after the cursor recorded in
-   your own state file, whichever is later).
-3. Update `~/.pi/agent/atc/shopify-mobile/state/<source>/last-check.json` ONLY after a
-   successful read. A failed run leaves state untouched so the next fire re-covers the
-   window.
-4. **IF NOTHING NEW:** call `subagent_done` (or `complete_task` when assigned) with a
-   final message that is the bare string `NO_FINDINGS` and NO other prose. Do NOT
-   `check_in`. Do NOT summarize, explain, or log to the transcript.
-5. **IF FINDINGS:** `check_in` exactly ONE compact structured finding — source, what
-   changed, why it crosses the threshold, report-file path, proposed human action — then
-   finish.
-6. Never write outside `~/.pi/agent/atc/shopify-mobile/`. Never mutate an external
-   system. Read/query gateway tools only; `gh` only via read-only subcommands.
-7. Every bash call passes `timeout: 60`. Never poll, never sleep, never loop.
-8. You are one-shot: do the check, report or stay silent, finish. Do not ask questions.
 
 ---
 
